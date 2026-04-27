@@ -1,0 +1,16 @@
+# xhisperflow configuration
+# Copy to ~/.config/xhisperflow/xhisperflowrc and customize
+# When in doubt, check by running 'xhisperflow --log'
+
+# Transcription Settings:
+long-recording-threshold : 1000
+transcription-prompt     : ""
+post-processing-enabled  : true
+post-processing-model    : "openai/gpt-oss-20b"
+post-processing-timeout  : 3
+output-method            : "type"
+clipboard-restore-delay  : 0.15
+
+# Paste Timing (seconds):
+non-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.
+non-ascii-default-delay : 0.025
