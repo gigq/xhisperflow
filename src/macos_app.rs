@@ -1,0 +1,1163 @@
+use crate::app::{LOG_PATH, load_home_env, log_timed_step, post_process, sleep_secs, transcribe};
+use crate::config::{Config, config_file_path};
+use anyhow::{Context, Result, anyhow, bail};
+use arboard::Clipboard;
+#[allow(deprecated)]
+use cocoa::appkit::NSColor;
+#[allow(deprecated)]
+use cocoa::base::{NO, YES, id, nil};
+#[allow(deprecated)]
+use cocoa::foundation::NSPoint;
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use enigo::{
+    Direction::{Click, Press, Release},
+    Enigo, Key, Keyboard, Settings,
+};
+use global_hotkey::{
+    GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+    hotkey::{Code, HotKey, Modifiers},
+};
+use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
+use objc::{class, msg_send, sel, sel_impl};
+use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+use softbuffer::Surface;
+use std::collections::VecDeque;
+use std::ffi::c_void;
+use std::fs::{self, File};
+use std::io::BufWriter;
+use std::num::NonZeroU32;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+use tray_icon::{
+    Icon, TrayIcon, TrayIconBuilder,
+    menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
+};
+use winit::application::ApplicationHandler;
+use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::event::WindowEvent;
+use winit::event_loop::{
+    ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
+};
+use winit::platform::macos::WindowAttributesExtMacOS;
+use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
+
+const MAC_RECORDING_PATH: &str = "/tmp/xhisperflow-mac.wav";
+const HUD_WIDTH: u32 = 360;
+const HUD_HEIGHT: u32 = 78;
+const HUD_TOP_OFFSET: i32 = 0;
+const HUD_BOTTOM_RADIUS: f64 = 18.0;
+const HUD_SHOULDER_Y: f64 = 14.0;
+const HUD_SHOULDER_INSET: f64 = 8.0;
+const WAVEFORM_HEIGHT: u32 = 58;
+const WAVEFORM_BOTTOM_PADDING: u32 = 14;
+const WAVEFORM_LEVEL_FLOOR: f32 = 0.06;
+const WAVEFORM_LEVEL_CEILING: f32 = 0.48;
+const LEVEL_HISTORY: usize = 180;
+
+type HudSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
+
+pub fn run() -> Result<()> {
+    load_home_env();
+
+    let event_loop = EventLoop::<UserEvent>::with_user_event()
+        .build()
+        .context("failed to build macOS event loop")?;
+    let proxy = event_loop.create_proxy();
+
+    let proxy_for_menu = proxy.clone();
+    MenuEvent::set_event_handler(Some(move |event| {
+        let _ = proxy_for_menu.send_event(UserEvent::Menu(event));
+    }));
+
+    let proxy_for_hotkey = proxy.clone();
+    GlobalHotKeyEvent::set_event_handler(Some(move |event| {
+        let _ = proxy_for_hotkey.send_event(UserEvent::HotKey(event));
+    }));
+
+    let mut app = MacApp::new(proxy)?;
+    event_loop
+        .run_app(&mut app)
+        .context("macOS app event loop failed")
+}
+
+#[derive(Debug)]
+enum UserEvent {
+    Menu(MenuEvent),
+    HotKey(GlobalHotKeyEvent),
+    Worker(WorkerEvent),
+}
+
+#[derive(Debug)]
+enum WorkerEvent {
+    TranscriptionFinished(Result<String, String>),
+}
+
+struct MacApp {
+    proxy: EventLoopProxy<UserEvent>,
+    config: Config,
+    tray: Option<TrayIcon>,
+    menu_ids: MenuIds,
+    toggle_item: Option<MenuItem>,
+    status_item: Option<MenuItem>,
+    hotkey: HotKey,
+    hotkey_manager: GlobalHotKeyManager,
+    window: Option<Rc<Window>>,
+    window_id: Option<WindowId>,
+    surface: Option<HudSurface>,
+    levels: Arc<Mutex<VecDeque<f32>>>,
+    recorder: Option<Recorder>,
+    state: AppState,
+    status: String,
+    started_at: Option<Instant>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct MenuIds {
+    toggle: MenuId,
+    open_config: MenuId,
+    show_log: MenuId,
+    permissions: MenuId,
+    quit: MenuId,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AppState {
+    Idle,
+    Recording,
+    Transcribing,
+    Pasting,
+}
+
+impl MacApp {
+    fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
+        let config = Config::load();
+        let hotkey = parse_hotkey(&config.mac_hotkey)?;
+        let hotkey_manager =
+            GlobalHotKeyManager::new().context("failed to create global hotkey manager")?;
+        hotkey_manager
+            .register(hotkey)
+            .with_context(|| format!("failed to register hotkey '{}'", config.mac_hotkey))?;
+
+        Ok(Self {
+            proxy,
+            config,
+            tray: None,
+            menu_ids: MenuIds::default(),
+            toggle_item: None,
+            status_item: None,
+            hotkey,
+            hotkey_manager,
+            window: None,
+            window_id: None,
+            surface: None,
+            levels: Arc::new(Mutex::new(VecDeque::with_capacity(LEVEL_HISTORY))),
+            recorder: None,
+            state: AppState::Idle,
+            status: "Ready".to_string(),
+            started_at: None,
+        })
+    }
+
+    fn build_tray(&mut self) -> Result<()> {
+        let menu = Menu::new();
+        let toggle = MenuItem::new("Start Recording", true, None);
+        let status = MenuItem::new("Ready", false, None);
+        let open_config = MenuItem::new("Open Config", true, None);
+        let show_log = MenuItem::new("Show Log", true, None);
+        let permissions = MenuItem::new("Permissions Help", true, None);
+        let quit = MenuItem::new("Quit", true, None);
+        let separator = PredefinedMenuItem::separator();
+        let separator_two = PredefinedMenuItem::separator();
+
+        menu.append_items(&[
+            &toggle,
+            &status,
+            &separator,
+            &open_config,
+            &show_log,
+            &permissions,
+            &separator_two,
+            &quit,
+        ])
+        .context("failed to build tray menu")?;
+
+        self.menu_ids = MenuIds {
+            toggle: toggle.id().clone(),
+            open_config: open_config.id().clone(),
+            show_log: show_log.id().clone(),
+            permissions: permissions.id().clone(),
+            quit: quit.id().clone(),
+        };
+        self.toggle_item = Some(toggle);
+        self.status_item = Some(status);
+
+        let tray = TrayIconBuilder::new()
+            .with_menu(Box::new(menu))
+            .with_tooltip("xhisperflow")
+            .with_icon(tray_icon_for_state(AppState::Idle)?)
+            .with_icon_as_template(true)
+            .build()
+            .context("failed to create menu bar icon")?;
+        self.tray = Some(tray);
+        Ok(())
+    }
+
+    fn create_hud(&mut self, event_loop: &ActiveEventLoop) -> Result<()> {
+        if self.window.is_some() {
+            return Ok(());
+        }
+
+        let attrs = WindowAttributes::default()
+            .with_title("xhisperflow")
+            .with_inner_size(LogicalSize::new(
+                f64::from(HUD_WIDTH),
+                f64::from(HUD_HEIGHT),
+            ))
+            .with_resizable(false)
+            .with_decorations(false)
+            .with_transparent(true)
+            .with_visible(false)
+            .with_window_level(WindowLevel::AlwaysOnTop)
+            .with_has_shadow(false)
+            .with_movable_by_window_background(true);
+
+        let window = Rc::new(
+            event_loop
+                .create_window(attrs)
+                .context("failed to create waveform HUD")?,
+        );
+        let context = softbuffer::Context::new(event_loop.owned_display_handle())
+            .map_err(|err| anyhow!("failed to create waveform drawing context: {err:?}"))?;
+        let surface = Surface::new(&context, window.clone())
+            .map_err(|err| anyhow!("failed to create waveform drawing surface: {err:?}"))?;
+        apply_notch_window_shape(&window);
+        self.window_id = Some(window.id());
+        self.surface = Some(surface);
+        self.window = Some(window);
+        Ok(())
+    }
+
+    fn handle_menu(&mut self, event_loop: &ActiveEventLoop, event: MenuEvent) {
+        let id = event.id();
+        if id == &self.menu_ids.toggle {
+            self.toggle_recording();
+        } else if id == &self.menu_ids.open_config {
+            self.open_config();
+        } else if id == &self.menu_ids.show_log {
+            self.open_path(Path::new(LOG_PATH));
+        } else if id == &self.menu_ids.permissions {
+            self.open_permissions_help();
+        } else if id == &self.menu_ids.quit {
+            event_loop.exit();
+        }
+    }
+
+    fn toggle_recording(&mut self) {
+        match self.state {
+            AppState::Idle => self.start_recording(),
+            AppState::Recording => self.stop_recording(),
+            AppState::Transcribing | AppState::Pasting => {
+                self.set_status("Busy");
+            }
+        }
+    }
+
+    fn start_recording(&mut self) {
+        self.clear_levels();
+        match Recorder::start(PathBuf::from(MAC_RECORDING_PATH), self.levels.clone()) {
+            Ok(recorder) => {
+                self.recorder = Some(recorder);
+                self.state = AppState::Recording;
+                self.started_at = Some(Instant::now());
+                self.set_status("Recording");
+                self.show_hud(true);
+            }
+            Err(err) => {
+                self.state = AppState::Idle;
+                self.set_status(&format!("Mic unavailable: {err:#}"));
+                self.show_hud(true);
+            }
+        }
+    }
+
+    fn stop_recording(&mut self) {
+        let Some(recorder) = self.recorder.take() else {
+            self.state = AppState::Idle;
+            self.set_status("Ready");
+            return;
+        };
+
+        self.state = AppState::Transcribing;
+        self.set_status("Transcribing");
+
+        match recorder.stop() {
+            Ok(path) => {
+                let config = self.config.clone();
+                let proxy = self.proxy.clone();
+                thread::spawn(move || {
+                    let started = Instant::now();
+                    let result = transcribe(&config, &path)
+                        .and_then(|text| post_process(&config, &text))
+                        .map_err(|err| format!("{err:#}"));
+                    let _ = log_timed_step(
+                        "macOS worker",
+                        "Transcription worker completed",
+                        started.elapsed(),
+                    );
+                    let _ = fs::remove_file(&path);
+                    let _ = proxy.send_event(UserEvent::Worker(
+                        WorkerEvent::TranscriptionFinished(result),
+                    ));
+                });
+            }
+            Err(err) => {
+                self.state = AppState::Idle;
+                self.set_status(&format!("Recording failed: {err:#}"));
+            }
+        }
+    }
+
+    fn finish_transcription(&mut self, result: Result<String, String>) {
+        match result {
+            Ok(text) if text.trim().is_empty() => {
+                self.state = AppState::Idle;
+                self.set_status("No speech");
+                self.show_hud(false);
+            }
+            Ok(text) => {
+                self.state = AppState::Pasting;
+                self.set_status("Pasting");
+                match paste_text(&self.config, &text) {
+                    Ok(()) => {
+                        self.state = AppState::Idle;
+                        self.set_status("Ready");
+                        self.show_hud(false);
+                    }
+                    Err(err) => {
+                        self.state = AppState::Idle;
+                        self.set_status(&format!("Paste failed; copied text: {err:#}"));
+                        self.show_hud(true);
+                    }
+                }
+            }
+            Err(err) => {
+                self.state = AppState::Idle;
+                self.set_status(&format!("Transcription failed: {err}"));
+                self.show_hud(true);
+            }
+        }
+    }
+
+    fn set_status(&mut self, status: &str) {
+        self.status = status.to_string();
+        if let Some(tray) = &self.tray {
+            if let Ok(icon) = tray_icon_for_state(self.state) {
+                let _ = tray.set_icon(Some(icon));
+            }
+        }
+        if let Some(item) = &self.status_item {
+            item.set_text(status);
+        }
+        if let Some(toggle) = &self.toggle_item {
+            let text = match self.state {
+                AppState::Recording => "Stop Recording",
+                AppState::Idle => "Start Recording",
+                AppState::Transcribing => "Transcribing...",
+                AppState::Pasting => "Pasting...",
+            };
+            toggle.set_text(text);
+            toggle.set_enabled(matches!(self.state, AppState::Idle | AppState::Recording));
+        }
+        if let Some(window) = &self.window {
+            window.set_title(&format!("xhisperflow - {status}"));
+            window.request_redraw();
+        }
+    }
+
+    fn clear_levels(&mut self) {
+        if let Ok(mut levels) = self.levels.lock() {
+            levels.clear();
+        }
+    }
+
+    fn show_preview_hud(&mut self) {
+        if let Ok(mut levels) = self.levels.lock() {
+            levels.clear();
+            for idx in 0..LEVEL_HISTORY {
+                let wave = (idx as f32 * 0.22).sin().abs();
+                let contour = 0.35 + 0.65 * (idx as f32 * 0.047).sin().abs();
+                levels.push_back((wave * contour).clamp(0.0, 1.0));
+            }
+        }
+        self.state = AppState::Recording;
+        self.show_hud(true);
+    }
+
+    fn show_hud(&self, visible: bool) {
+        if let Some(window) = &self.window {
+            if visible {
+                position_hud_at_notch(window);
+            }
+            window.set_visible(visible && self.config.mac_floating_waveform);
+            if visible {
+                window.request_redraw();
+            }
+        }
+    }
+
+    fn open_config(&self) {
+        let path = config_file_path();
+        if !path.exists() {
+            if let Err(err) = crate::app::install_default_config(&path) {
+                eprintln!("failed to create config: {err:#}");
+                return;
+            }
+        }
+        self.open_path(&path);
+    }
+
+    fn open_path(&self, path: &Path) {
+        if let Err(err) = std::process::Command::new("open").arg(path).status() {
+            eprintln!("failed to open {}: {err}", path.display());
+        }
+    }
+
+    fn open_permissions_help(&self) {
+        for url in [
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
+            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
+        ] {
+            let _ = std::process::Command::new("open").arg(url).status();
+        }
+    }
+
+    fn draw_hud(&mut self) -> Result<()> {
+        let Some(window) = &self.window else {
+            return Ok(());
+        };
+        let Some(surface) = self.surface.as_mut() else {
+            return Ok(());
+        };
+
+        let size = window.inner_size();
+        if size.width == 0 || size.height == 0 {
+            return Ok(());
+        }
+
+        let width = NonZeroU32::new(size.width).ok_or_else(|| anyhow!("invalid HUD width"))?;
+        let height = NonZeroU32::new(size.height).ok_or_else(|| anyhow!("invalid HUD height"))?;
+        surface
+            .resize(width, height)
+            .map_err(|err| anyhow!("failed to resize waveform surface: {err:?}"))?;
+
+        let levels = self
+            .levels
+            .lock()
+            .map(|levels| levels.iter().copied().collect::<Vec<_>>())
+            .unwrap_or_default();
+        let mut buffer = surface
+            .buffer_mut()
+            .map_err(|err| anyhow!("failed to acquire waveform buffer: {err:?}"))?;
+        let gradient_start = parse_hex_color(
+            &self.config.mac_waveform_gradient_start,
+            HudColor::new(181, 140, 255),
+        );
+        let gradient_end = parse_hex_color(
+            &self.config.mac_waveform_gradient_end,
+            HudColor::new(215, 230, 255),
+        );
+        draw_waveform(
+            &mut buffer,
+            size,
+            &levels,
+            self.state,
+            gradient_start,
+            gradient_end,
+        );
+        buffer
+            .present()
+            .map_err(|err| anyhow!("failed to present waveform buffer: {err:?}"))?;
+        Ok(())
+    }
+}
+
+impl ApplicationHandler<UserEvent> for MacApp {
+    fn resumed(&mut self, event_loop: &ActiveEventLoop) {
+        if let Err(err) = self.create_hud(event_loop) {
+            eprintln!("{err:#}");
+            event_loop.exit();
+            return;
+        }
+        if self.tray.is_none() {
+            if let Err(err) = self.build_tray() {
+                eprintln!("{err:#}");
+                event_loop.exit();
+            }
+        }
+        if std::env::var_os("XHISPERFLOW_HUD_PREVIEW").is_some() {
+            self.show_preview_hud();
+        }
+    }
+
+    fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
+        match event {
+            UserEvent::Menu(event) => self.handle_menu(event_loop, event),
+            UserEvent::HotKey(event) => {
+                if event.id == self.hotkey.id() && matches!(event.state, HotKeyState::Pressed) {
+                    self.toggle_recording();
+                }
+            }
+            UserEvent::Worker(WorkerEvent::TranscriptionFinished(result)) => {
+                self.finish_transcription(result);
+            }
+        }
+    }
+
+    fn window_event(
+        &mut self,
+        _event_loop: &ActiveEventLoop,
+        window_id: WindowId,
+        event: WindowEvent,
+    ) {
+        if Some(window_id) != self.window_id {
+            return;
+        }
+
+        match event {
+            WindowEvent::RedrawRequested => {
+                if let Err(err) = self.draw_hud() {
+                    eprintln!("failed to draw waveform HUD: {err:#}");
+                }
+            }
+            WindowEvent::Resized(_) => {
+                if let Some(window) = &self.window {
+                    window.request_redraw();
+                }
+            }
+            WindowEvent::CloseRequested => self.show_hud(false),
+            _ => {}
+        }
+    }
+
+    fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        if matches!(self.state, AppState::Recording) {
+            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(33)));
+            if let Some(window) = &self.window {
+                window.request_redraw();
+            }
+        } else {
+            event_loop.set_control_flow(ControlFlow::Wait);
+        }
+    }
+
+    fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        let _ = self.hotkey_manager.unregister(self.hotkey);
+        if let Some(recorder) = self.recorder.take() {
+            let _ = recorder.stop();
+        }
+    }
+}
+
+struct Recorder {
+    stream: cpal::Stream,
+    writer: Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    output_path: PathBuf,
+}
+
+impl Recorder {
+    fn start(output_path: PathBuf, levels: Arc<Mutex<VecDeque<f32>>>) -> Result<Self> {
+        let host = cpal::default_host();
+        let device = host
+            .default_input_device()
+            .ok_or_else(|| anyhow!("no default input device"))?;
+        let input_config = device
+            .default_input_config()
+            .context("failed to read default input config")?;
+        let sample_rate = input_config.sample_rate();
+        let channels = usize::from(input_config.channels());
+        if channels == 0 {
+            bail!("input device reports zero channels");
+        }
+
+        let spec = WavSpec {
+            channels: 1,
+            sample_rate,
+            bits_per_sample: 16,
+            sample_format: WavSampleFormat::Int,
+        };
+        let writer = WavWriter::create(&output_path, spec).context("failed to create wav file")?;
+        let writer = Arc::new(Mutex::new(Some(writer)));
+        let writer_for_callback = writer.clone();
+        let err_fn = |err| eprintln!("macOS audio input error: {err}");
+
+        let stream_config = input_config.config();
+        let stream = match input_config.sample_format() {
+            cpal::SampleFormat::F32 => device.build_input_stream(
+                &stream_config,
+                move |data: &[f32], _| {
+                    write_f32_input(data, channels, &writer_for_callback, &levels)
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::F64 => device.build_input_stream(
+                &stream_config,
+                move |data: &[f64], _| {
+                    write_f64_input(data, channels, &writer_for_callback, &levels)
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::I16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[i16], _| {
+                    write_i16_input(data, channels, &writer_for_callback, &levels)
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::I32 => device.build_input_stream(
+                &stream_config,
+                move |data: &[i32], _| {
+                    write_i32_input(data, channels, &writer_for_callback, &levels)
+                },
+                err_fn,
+                None,
+            ),
+            cpal::SampleFormat::U16 => device.build_input_stream(
+                &stream_config,
+                move |data: &[u16], _| {
+                    write_u16_input(data, channels, &writer_for_callback, &levels)
+                },
+                err_fn,
+                None,
+            ),
+            other => bail!("unsupported input sample format: {other:?}"),
+        }
+        .context("failed to build input stream")?;
+
+        stream.play().context("failed to start input stream")?;
+        Ok(Self {
+            stream,
+            writer,
+            output_path,
+        })
+    }
+
+    fn stop(self) -> Result<PathBuf> {
+        drop(self.stream);
+        if let Some(writer) = self
+            .writer
+            .lock()
+            .map_err(|_| anyhow!("wav writer lock poisoned"))?
+            .take()
+        {
+            writer.finalize().context("failed to finalize wav file")?;
+        }
+        Ok(self.output_path)
+    }
+}
+
+fn write_f32_input(
+    data: &[f32],
+    channels: usize,
+    writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    levels: &Arc<Mutex<VecDeque<f32>>>,
+) {
+    write_input(
+        data.chunks(channels)
+            .map(|frame| frame.iter().copied().sum::<f32>() / frame.len() as f32),
+        writer,
+        levels,
+    );
+}
+
+fn write_f64_input(
+    data: &[f64],
+    channels: usize,
+    writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    levels: &Arc<Mutex<VecDeque<f32>>>,
+) {
+    write_input(
+        data.chunks(channels)
+            .map(|frame| (frame.iter().copied().sum::<f64>() / frame.len() as f64) as f32),
+        writer,
+        levels,
+    );
+}
+
+fn write_i16_input(
+    data: &[i16],
+    channels: usize,
+    writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    levels: &Arc<Mutex<VecDeque<f32>>>,
+) {
+    write_input(
+        data.chunks(channels).map(|frame| {
+            frame
+                .iter()
+                .map(|sample| f32::from(*sample) / f32::from(i16::MAX))
+                .sum::<f32>()
+                / frame.len() as f32
+        }),
+        writer,
+        levels,
+    );
+}
+
+fn write_i32_input(
+    data: &[i32],
+    channels: usize,
+    writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    levels: &Arc<Mutex<VecDeque<f32>>>,
+) {
+    write_input(
+        data.chunks(channels).map(|frame| {
+            frame
+                .iter()
+                .map(|sample| *sample as f32 / i32::MAX as f32)
+                .sum::<f32>()
+                / frame.len() as f32
+        }),
+        writer,
+        levels,
+    );
+}
+
+fn write_u16_input(
+    data: &[u16],
+    channels: usize,
+    writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    levels: &Arc<Mutex<VecDeque<f32>>>,
+) {
+    write_input(
+        data.chunks(channels).map(|frame| {
+            frame
+                .iter()
+                .map(|sample| (*sample as f32 - 32768.0) / 32768.0)
+                .sum::<f32>()
+                / frame.len() as f32
+        }),
+        writer,
+        levels,
+    );
+}
+
+fn write_input<I>(
+    samples: I,
+    writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
+    levels: &Arc<Mutex<VecDeque<f32>>>,
+) where
+    I: Iterator<Item = f32>,
+{
+    let mut sum = 0.0_f32;
+    let mut count = 0_usize;
+    if let Ok(mut guard) = writer.lock() {
+        if let Some(writer) = guard.as_mut() {
+            for sample in samples {
+                let sample = sample.clamp(-1.0, 1.0);
+                let pcm = (sample * f32::from(i16::MAX)).round() as i16;
+                let _ = writer.write_sample(pcm);
+                sum += sample * sample;
+                count += 1;
+            }
+        }
+    }
+
+    if count == 0 {
+        return;
+    }
+    let rms = (sum / count as f32).sqrt().clamp(0.0, 1.0);
+    if let Ok(mut levels) = levels.lock() {
+        let previous = levels.back().copied().unwrap_or(0.0);
+        let smoothed = previous * 0.72 + rms * 0.28;
+        if levels.len() >= LEVEL_HISTORY {
+            levels.pop_front();
+        }
+        levels.push_back(smoothed);
+    }
+}
+
+fn paste_text(config: &Config, text: &str) -> Result<()> {
+    let mut clipboard = Clipboard::new().context("failed to access clipboard")?;
+    let saved = clipboard.get_text().ok();
+    clipboard
+        .set_text(text.to_string())
+        .context("failed to copy transcript")?;
+
+    let mut enigo = Enigo::new(&Settings::default()).context("failed to create input simulator")?;
+    enigo
+        .key(Key::Meta, Press)
+        .context("failed to press Command key")?;
+    let paste_result = enigo
+        .key(Key::Unicode('v'), Click)
+        .context("failed to press V key");
+    let release_result = enigo
+        .key(Key::Meta, Release)
+        .context("failed to release Command key");
+    paste_result.and(release_result)?;
+
+    if let Some(saved) = saved {
+        let delay = config.clipboard_restore_delay_secs;
+        thread::spawn(move || {
+            sleep_secs(delay);
+            if let Ok(mut clipboard) = Clipboard::new() {
+                let _ = clipboard.set_text(saved);
+            }
+        });
+    }
+
+    Ok(())
+}
+
+fn parse_hotkey(value: &str) -> Result<HotKey> {
+    let normalized = value
+        .split('+')
+        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
+            "option" | "opt" | "alt" => "alt".to_string(),
+            "cmd" | "command" | "meta" | "super" => "super".to_string(),
+            "ctrl" | "control" => "ctrl".to_string(),
+            "shift" => "shift".to_string(),
+            "space" => "space".to_string(),
+            other => other.to_string(),
+        })
+        .collect::<Vec<_>>()
+        .join("+");
+
+    normalized
+        .parse::<HotKey>()
+        .or_else(|_| {
+            if normalized == "alt+space" {
+                Ok(HotKey::new(Some(Modifiers::ALT), Code::Space))
+            } else {
+                normalized.parse::<HotKey>()
+            }
+        })
+        .with_context(|| format!("invalid hotkey '{value}'"))
+}
+
+fn draw_waveform(
+    buffer: &mut softbuffer::Buffer<'_, OwnedDisplayHandle, Rc<Window>>,
+    size: PhysicalSize<u32>,
+    levels: &[f32],
+    state: AppState,
+    gradient_start: HudColor,
+    gradient_end: HudColor,
+) {
+    let width = size.width.max(1);
+    let height = size.height.max(1);
+    for pixel in buffer.iter_mut() {
+        *pixel = rgb(0, 0, 0);
+    }
+
+    let waveform_bottom = height.saturating_sub(WAVEFORM_BOTTOM_PADDING).max(1);
+    let waveform_top = waveform_bottom.saturating_sub(WAVEFORM_HEIGHT);
+    let center = waveform_top + (waveform_bottom.saturating_sub(waveform_top) / 2);
+
+    let left = 42_u32;
+    let right = width.saturating_sub(42);
+    let bar_width = 3_u32;
+    let gap = 5_u32;
+    let stride = bar_width + gap;
+    let drawable_width = right.saturating_sub(left).max(1);
+    let bar_count = (drawable_width / stride).max(1);
+
+    for bar_index in 0..bar_count {
+        let x = left + bar_index * stride;
+        let progress = bar_index as f32 / bar_count.saturating_sub(1).max(1) as f32;
+        let color = gradient_start.mix(gradient_end, progress).to_pixel();
+        let raw_level = if levels.is_empty() {
+            0.18
+        } else {
+            let idx = (bar_index as usize * levels.len() / bar_count as usize)
+                .min(levels.len().saturating_sub(1));
+            let response = match state {
+                AppState::Recording => 1.8,
+                AppState::Transcribing => 0.9,
+                AppState::Pasting => 0.55,
+                AppState::Idle => 0.35,
+            };
+            (levels[idx].sqrt() * response).clamp(0.0, 1.0)
+        };
+        let level = shape_waveform_level(raw_level);
+        let distance_from_center = ((progress - 0.5).abs() * 2.0).clamp(0.0, 1.0);
+        let taper = 1.0 - distance_from_center * 0.62;
+        let bar_height = (4.0 + level * taper * WAVEFORM_HEIGHT as f32).round() as u32;
+        let y = center.saturating_sub(bar_height / 2);
+        draw_waveform_bar(buffer, width, x, y, bar_width, bar_height, color);
+    }
+}
+
+fn shape_waveform_level(level: f32) -> f32 {
+    let normalized = ((level - WAVEFORM_LEVEL_FLOOR)
+        / (WAVEFORM_LEVEL_CEILING - WAVEFORM_LEVEL_FLOOR))
+        .clamp(0.0, 1.0);
+    normalized * normalized * (3.0 - 2.0 * normalized)
+}
+
+fn draw_waveform_bar(
+    buffer: &mut softbuffer::Buffer<'_, OwnedDisplayHandle, Rc<Window>>,
+    width: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: u32,
+) {
+    if h <= 2 {
+        draw_rect(buffer, width, x, y, w, h, color);
+        return;
+    }
+
+    draw_rect(
+        buffer,
+        width,
+        x + 1,
+        y,
+        w.saturating_sub(2).max(1),
+        1,
+        color,
+    );
+    draw_rect(buffer, width, x, y + 1, w, h.saturating_sub(2), color);
+    draw_rect(
+        buffer,
+        width,
+        x + 1,
+        y + h.saturating_sub(1),
+        w.saturating_sub(2).max(1),
+        1,
+        color,
+    );
+}
+
+fn position_hud_at_notch(window: &Window) {
+    let Some(monitor) = window
+        .current_monitor()
+        .or_else(|| window.primary_monitor())
+        .or_else(|| window.available_monitors().next())
+    else {
+        return;
+    };
+
+    let monitor_position = monitor.position();
+    let monitor_size = monitor.size();
+    let window_size = window.outer_size();
+    let x =
+        monitor_position.x + ((monitor_size.width as i32 - window_size.width as i32) / 2).max(0);
+    let y = monitor_position.y + HUD_TOP_OFFSET;
+    window.set_outer_position(PhysicalPosition::new(x, y));
+}
+
+#[allow(deprecated, unexpected_cfgs)]
+fn apply_notch_window_shape(window: &Window) {
+    let Ok(handle) = window.window_handle() else {
+        return;
+    };
+
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+
+    unsafe {
+        let view = handle.ns_view.as_ptr() as id;
+        let ns_window: id = msg_send![view, window];
+        if ns_window != nil {
+            let clear = NSColor::clearColor(nil);
+            let level: isize = 25;
+            let _: () = msg_send![ns_window, setOpaque: NO];
+            let _: () = msg_send![ns_window, setBackgroundColor: clear];
+            let _: () = msg_send![ns_window, setHasShadow: NO];
+            let _: () = msg_send![ns_window, setLevel: level];
+        }
+
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let layer: id = msg_send![view, layer];
+        if layer != nil {
+            let _: () = msg_send![layer, setMasksToBounds: YES];
+            let mask = create_notch_mask_layer(f64::from(HUD_WIDTH), f64::from(HUD_HEIGHT));
+            if mask != nil {
+                let _: () = msg_send![layer, setMask: mask];
+            }
+        }
+    }
+}
+
+#[allow(deprecated, unexpected_cfgs)]
+unsafe fn create_notch_mask_layer(width: f64, height: f64) -> id {
+    let bottom_radius = HUD_BOTTOM_RADIUS;
+    let shoulder_y = HUD_SHOULDER_Y;
+    let shoulder_inset = HUD_SHOULDER_INSET;
+    let path: id = msg_send![class!(NSBezierPath), bezierPath];
+    if path == nil {
+        return nil;
+    }
+
+    let _: () = msg_send![path, moveToPoint: NSPoint::new(0.0, 0.0)];
+    let _: () = msg_send![path, lineToPoint: NSPoint::new(width, 0.0)];
+    let _: () = msg_send![
+        path,
+        curveToPoint: NSPoint::new(width - shoulder_inset, shoulder_y)
+        controlPoint1: NSPoint::new(width - shoulder_inset * 0.18, 0.0)
+        controlPoint2: NSPoint::new(width - shoulder_inset, shoulder_y * 0.42)
+    ];
+    let _: () = msg_send![
+        path,
+        lineToPoint: NSPoint::new(width - shoulder_inset, height - bottom_radius)
+    ];
+    let _: () = msg_send![
+        path,
+        curveToPoint: NSPoint::new(width - shoulder_inset - bottom_radius, height)
+        controlPoint1: NSPoint::new(width - shoulder_inset, height - bottom_radius * 0.45)
+        controlPoint2: NSPoint::new(width - shoulder_inset - bottom_radius * 0.45, height)
+    ];
+    let _: () = msg_send![
+        path,
+        lineToPoint: NSPoint::new(shoulder_inset + bottom_radius, height)
+    ];
+    let _: () = msg_send![
+        path,
+        curveToPoint: NSPoint::new(shoulder_inset, height - bottom_radius)
+        controlPoint1: NSPoint::new(shoulder_inset + bottom_radius * 0.45, height)
+        controlPoint2: NSPoint::new(shoulder_inset, height - bottom_radius * 0.45)
+    ];
+    let _: () = msg_send![
+        path,
+        lineToPoint: NSPoint::new(shoulder_inset, shoulder_y)
+    ];
+    let _: () = msg_send![
+        path,
+        curveToPoint: NSPoint::new(0.0, 0.0)
+        controlPoint1: NSPoint::new(shoulder_inset, shoulder_y * 0.42)
+        controlPoint2: NSPoint::new(shoulder_inset * 0.18, 0.0)
+    ];
+    let _: () = msg_send![path, closePath];
+
+    let cg_path: *const c_void = msg_send![path, CGPath];
+    if cg_path.is_null() {
+        return nil;
+    }
+
+    let mask: id = msg_send![class!(CAShapeLayer), layer];
+    if mask != nil {
+        let _: () = msg_send![mask, setPath: cg_path];
+    }
+    mask
+}
+
+fn draw_rect(
+    buffer: &mut softbuffer::Buffer<'_, OwnedDisplayHandle, Rc<Window>>,
+    width: u32,
+    x: u32,
+    y: u32,
+    w: u32,
+    h: u32,
+    color: u32,
+) {
+    let buffer_width = width as usize;
+    let buffer_len = buffer.len();
+    for row in y..y.saturating_add(h) {
+        let start = row as usize * buffer_width + x as usize;
+        if start >= buffer_len {
+            break;
+        }
+        let end = (start + w as usize).min(buffer_len);
+        for pixel in &mut buffer[start..end] {
+            *pixel = color;
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+struct HudColor {
+    r: u8,
+    g: u8,
+    b: u8,
+}
+
+impl HudColor {
+    const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+
+    fn mix(self, other: Self, amount: f32) -> Self {
+        let amount = amount.clamp(0.0, 1.0);
+        Self {
+            r: mix_channel(self.r, other.r, amount),
+            g: mix_channel(self.g, other.g, amount),
+            b: mix_channel(self.b, other.b, amount),
+        }
+    }
+
+    fn to_pixel(self) -> u32 {
+        rgb(u32::from(self.r), u32::from(self.g), u32::from(self.b))
+    }
+}
+
+fn parse_hex_color(value: &str, fallback: HudColor) -> HudColor {
+    let value = value.trim().trim_matches('"').trim_start_matches('#');
+    if value.len() != 6 {
+        return fallback;
+    }
+
+    let Ok(parsed) = u32::from_str_radix(value, 16) else {
+        return fallback;
+    };
+
+    HudColor::new(
+        ((parsed >> 16) & 0xff) as u8,
+        ((parsed >> 8) & 0xff) as u8,
+        (parsed & 0xff) as u8,
+    )
+}
+
+fn mix_channel(start: u8, end: u8, amount: f32) -> u8 {
+    (start as f32 + (end as f32 - start as f32) * amount).round() as u8
+}
+
+fn rgb(r: u32, g: u32, b: u32) -> u32 {
+    b | (g << 8) | (r << 16)
+}
+
+fn tray_icon_for_state(state: AppState) -> Result<Icon> {
+    let width = 22_usize;
+    let height = 18_usize;
+    let mut rgba = vec![0_u8; width * height * 4];
+    let bars = match state {
+        AppState::Recording => [3, 7, 12, 15, 10, 6, 13, 16, 9, 5, 11],
+        AppState::Transcribing | AppState::Pasting => [4, 5, 7, 9, 12, 14, 12, 9, 7, 5, 4],
+        AppState::Idle => [3, 5, 8, 11, 8, 5, 3, 5, 8, 5, 3],
+    };
+
+    for (bar_index, bar_height) in bars.iter().enumerate() {
+        let x = 1 + bar_index * 2;
+        let top = (height - *bar_height) / 2;
+        for y in top..top + *bar_height {
+            set_icon_pixel(&mut rgba, width, x, y);
+            if *bar_height > 10 {
+                set_icon_pixel(&mut rgba, width, x + 1, y);
+            }
+        }
+    }
+
+    if matches!(state, AppState::Recording) {
+        for y in 3..15 {
+            set_icon_pixel(&mut rgba, width, 20, y);
+        }
+    }
+
+    Icon::from_rgba(rgba, width as u32, height as u32).context("failed to build tray icon")
+}
+
+fn set_icon_pixel(rgba: &mut [u8], width: usize, x: usize, y: usize) {
+    let idx = (y * width + x) * 4;
+    if idx + 3 >= rgba.len() {
+        return;
+    }
+    rgba[idx] = 255;
+    rgba[idx + 1] = 255;
+    rgba[idx + 2] = 255;
+    rgba[idx + 3] = 255;
+}

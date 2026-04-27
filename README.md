@@ -33,6 +33,37 @@ This produces:
 - `wl-copy` / `wl-paste` or `xclip` for clipboard support
 - access to `/dev/uinput` when the helper daemon is used
 
+## macOS
+
+The macOS app is a native Rust menu bar app with a global recording hotkey,
+floating waveform HUD, Groq transcription, and paste into the active app.
+
+Build the app bundle:
+
+```sh
+scripts/build-macos-app.sh
+open target/xhisperflow.app
+```
+
+The app uses `Option+Space` by default. Configure it in:
+
+```sh
+~/Library/Application Support/xhisperflow/xhisperflowrc
+```
+
+The floating HUD can be disabled with `mac-floating-waveform : false`. Its
+waveform colors are configured with `mac-waveform-gradient-start` and
+`mac-waveform-gradient-end` using quoted `#RRGGBB` values.
+
+Required macOS permissions:
+
+- Microphone, for recording.
+- Accessibility, for pasting the final transcript with Command+V.
+
+The menu bar app includes a Permissions Help item that opens the relevant
+System Settings panes. If Accessibility paste is not allowed, the transcript is
+left on the clipboard.
+
 ## Config
 
 Copy [default_xhisperflowrc](./default_xhisperflowrc) to:

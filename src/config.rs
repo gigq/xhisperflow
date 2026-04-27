@@ -20,6 +20,10 @@ pub struct Config {
     pub non_ascii_initial_delay_secs: f64,
     pub non_ascii_default_delay_secs: f64,
     pub hallucination_no_speech_threshold: f64,
+    pub mac_hotkey: String,
+    pub mac_floating_waveform: bool,
+    pub mac_waveform_gradient_start: String,
+    pub mac_waveform_gradient_end: String,
 }
 
 impl Default for Config {
@@ -35,6 +39,10 @@ impl Default for Config {
             non_ascii_initial_delay_secs: 0.1,
             non_ascii_default_delay_secs: 0.025,
             hallucination_no_speech_threshold: 0.1,
+            mac_hotkey: "alt+space".to_string(),
+            mac_floating_waveform: true,
+            mac_waveform_gradient_start: "#b58cff".to_string(),
+            mac_waveform_gradient_end: "#d7e6ff".to_string(),
         }
     }
 }
@@ -105,6 +113,20 @@ impl Config {
                         config.non_ascii_default_delay_secs = parsed;
                     }
                 }
+                "hotkey" if !value.is_empty() => {
+                    config.mac_hotkey = value;
+                }
+                "mac-floating-waveform" => {
+                    if let Some(parsed) = parse_bool(&value) {
+                        config.mac_floating_waveform = parsed;
+                    }
+                }
+                "mac-waveform-gradient-start" if !value.is_empty() => {
+                    config.mac_waveform_gradient_start = value;
+                }
+                "mac-waveform-gradient-end" if !value.is_empty() => {
+                    config.mac_waveform_gradient_end = value;
+                }
                 _ => {}
             }
         }
@@ -114,12 +136,23 @@ impl Config {
 }
 
 pub fn config_file_path() -> PathBuf {
+    #[cfg(target_os = "macos")]
+    {
+        return home_dir()
+            .join("Library")
+            .join("Application Support")
+            .join("xhisperflow")
+            .join("xhisperflowrc");
+    }
+
+    #[cfg(not(target_os = "macos"))]
     if let Some(path) = env::var_os("XDG_CONFIG_HOME") {
         return PathBuf::from(path)
             .join("xhisperflow")
             .join("xhisperflowrc");
     }
 
+    #[cfg(not(target_os = "macos"))]
     home_dir()
         .join(".config")
         .join("xhisperflow")
@@ -166,11 +199,20 @@ fn strip_inline_comment(input: &str) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::strip_inline_comment;
+    use super::{Config, strip_inline_comment};
 
     #[test]
     fn strips_trailing_comments() {
         assert_eq!(strip_inline_comment("0.15 # comment"), "0.15 ");
         assert_eq!(strip_inline_comment("\"#kept\" # comment"), "\"#kept\" ");
+    }
+
+    #[test]
+    fn mac_defaults_are_present() {
+        let config = Config::default();
+        assert_eq!(config.mac_hotkey, "alt+space");
+        assert!(config.mac_floating_waveform);
+        assert_eq!(config.mac_waveform_gradient_start, "#b58cff");
+        assert_eq!(config.mac_waveform_gradient_end, "#d7e6ff");
     }
 }

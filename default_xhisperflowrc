@@ -14,3 +14,9 @@ clipboard-restore-delay  : 0.15
 # Paste Timing (seconds):
 non-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.
 non-ascii-default-delay : 0.025
+
+# macOS App:
+hotkey                      : "alt+space"
+mac-floating-waveform       : true
+mac-waveform-gradient-start : "#b58cff"
+mac-waveform-gradient-end   : "#d7e6ff"

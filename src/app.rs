@@ -13,7 +13,7 @@ use std::process::{Child, Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
 const RECORDING_PATH: &str = "/tmp/xhisperflow.wav";
-const LOG_PATH: &str = "/tmp/xhisperflow.log";
+pub(crate) const LOG_PATH: &str = "/tmp/xhisperflow.log";
 const RECORDING_PID_PATH: &str = "/tmp/xhisperflow-recording.pid";
 const NOTIFICATION_ID_PATH: &str = "/tmp/xhisperflow-notification.id";
 const POST_PROCESSING_SYSTEM_PROMPT: &str = r#"You are a literal dictation cleanup layer.
@@ -321,7 +321,7 @@ fn ensure_helper_available(needs_helper: bool, wrap_key_needed: bool) -> Result<
     bail!("failed to start xhisperflowtoold");
 }
 
-fn transcribe(config: &Config, recording: &Path) -> Result<String> {
+pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
     let logging_start = Instant::now();
     let api_key = groq_api_key()?;
     let duration = wav_duration_seconds(recording).unwrap_or(0.0);
@@ -367,7 +367,7 @@ fn transcribe(config: &Config, recording: &Path) -> Result<String> {
     Ok(transcription)
 }
 
-fn post_process(config: &Config, transcript: &str) -> Result<String> {
+pub(crate) fn post_process(config: &Config, transcript: &str) -> Result<String> {
     if !config.post_processing_enabled || transcript.trim().is_empty() {
         return Ok(transcript.to_string());
     }
@@ -473,7 +473,7 @@ fn groq_api_key() -> Result<String> {
         .ok_or_else(|| anyhow::anyhow!("GROQ_API_KEY is not set"))
 }
 
-fn load_home_env() {
+pub(crate) fn load_home_env() {
     let path = home_dir().join(".env");
     let Ok(contents) = fs::read_to_string(path) else {
         return;
@@ -535,7 +535,7 @@ fn wav_duration_seconds(path: &Path) -> Result<f64> {
     Ok(data_size / bytes_per_second)
 }
 
-fn log_timed_step(title: &str, detail: &str, elapsed: Duration) -> Result<()> {
+pub(crate) fn log_timed_step(title: &str, detail: &str, elapsed: Duration) -> Result<()> {
     let mut file = open_append(LOG_PATH)?;
     writeln!(file, "=== {title} ===")?;
     writeln!(file, "Result: [{detail}]")?;
@@ -551,7 +551,7 @@ fn open_append(path: impl AsRef<Path>) -> Result<File> {
         .context("failed to open append file")
 }
 
-fn sleep_secs(secs: f64) {
+pub(crate) fn sleep_secs(secs: f64) {
     if secs > 0.0 {
         thread::sleep(Duration::from_secs_f64(secs));
     }
@@ -884,7 +884,7 @@ pub fn install_default_config(path: impl AsRef<Path>) -> Result<()> {
     }
     fs::write(
         path,
-        b"# xhisperflow configuration\n# Copy to ~/.config/xhisperflow/xhisperflowrc and customize\n# When in doubt, check by running 'xhisperflow --log'\n\n# Transcription Settings:\nlong-recording-threshold : 1000\ntranscription-prompt     : \"\"\npost-processing-enabled  : true\npost-processing-model    : \"openai/gpt-oss-20b\"\npost-processing-timeout  : 3\noutput-method            : \"type\"\nclipboard-restore-delay  : 0.15\n\n# Paste Timing (seconds):\nnon-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.\nnon-ascii-default-delay : 0.025\n",
+        b"# xhisperflow configuration\n# Customize this file at the platform config path.\n# When in doubt, check by running 'xhisperflow --log'\n\n# Transcription Settings:\nlong-recording-threshold : 1000\ntranscription-prompt     : \"\"\npost-processing-enabled  : true\npost-processing-model    : \"openai/gpt-oss-20b\"\npost-processing-timeout  : 3\noutput-method            : \"type\"\nclipboard-restore-delay  : 0.15\n\n# Paste Timing (seconds):\nnon-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.\nnon-ascii-default-delay : 0.025\n\n# macOS App:\nhotkey                      : \"alt+space\"\nmac-floating-waveform       : true\nmac-waveform-gradient-start : \"#b58cff\"\nmac-waveform-gradient-end   : \"#d7e6ff\"\n",
     )
     .context("failed to write default config")
 }
