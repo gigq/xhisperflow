@@ -21,6 +21,7 @@ pub struct Config {
     pub non_ascii_default_delay_secs: f64,
     pub hallucination_no_speech_threshold: f64,
     pub mac_hotkey: String,
+    pub mac_cancel_hotkey: String,
     pub mac_floating_waveform: bool,
     pub mac_waveform_gradient_start: String,
     pub mac_waveform_gradient_end: String,
@@ -40,6 +41,7 @@ impl Default for Config {
             non_ascii_default_delay_secs: 0.025,
             hallucination_no_speech_threshold: 0.1,
             mac_hotkey: "alt+space".to_string(),
+            mac_cancel_hotkey: "shift+esc".to_string(),
             mac_floating_waveform: true,
             mac_waveform_gradient_start: "#b58cff".to_string(),
             mac_waveform_gradient_end: "#d7e6ff".to_string(),
@@ -115,6 +117,9 @@ impl Config {
                 }
                 "hotkey" if !value.is_empty() => {
                     config.mac_hotkey = value;
+                }
+                "cancel-hotkey" => {
+                    config.mac_cancel_hotkey = value;
                 }
                 "mac-floating-waveform" => {
                     if let Some(parsed) = parse_bool(&value) {
@@ -211,6 +216,7 @@ mod tests {
     fn mac_defaults_are_present() {
         let config = Config::default();
         assert_eq!(config.mac_hotkey, "alt+space");
+        assert_eq!(config.mac_cancel_hotkey, "shift+esc");
         assert!(config.mac_floating_waveform);
         assert_eq!(config.mac_waveform_gradient_start, "#b58cff");
         assert_eq!(config.mac_waveform_gradient_end, "#d7e6ff");

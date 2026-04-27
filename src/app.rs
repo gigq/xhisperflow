@@ -884,7 +884,7 @@ pub fn install_default_config(path: impl AsRef<Path>) -> Result<()> {
     }
     fs::write(
         path,
-        b"# xhisperflow configuration\n# Customize this file at the platform config path.\n# When in doubt, check by running 'xhisperflow --log'\n\n# Transcription Settings:\nlong-recording-threshold : 1000\ntranscription-prompt     : \"\"\npost-processing-enabled  : true\npost-processing-model    : \"openai/gpt-oss-20b\"\npost-processing-timeout  : 3\noutput-method            : \"type\"\nclipboard-restore-delay  : 0.15\n\n# Paste Timing (seconds):\nnon-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.\nnon-ascii-default-delay : 0.025\n\n# macOS App:\nhotkey                      : \"alt+space\"\nmac-floating-waveform       : true\nmac-waveform-gradient-start : \"#b58cff\"\nmac-waveform-gradient-end   : \"#d7e6ff\"\n",
+        b"# xhisperflow configuration\n# Customize this file at the platform config path.\n# When in doubt, check by running 'xhisperflow --log'\n\n# Transcription Settings:\nlong-recording-threshold : 1000\ntranscription-prompt     : \"\"\npost-processing-enabled  : true\npost-processing-model    : \"openai/gpt-oss-20b\"\npost-processing-timeout  : 3\noutput-method            : \"type\"\nclipboard-restore-delay  : 0.15\n\n# Paste Timing (seconds):\nnon-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.\nnon-ascii-default-delay : 0.025\n\n# macOS App:\nhotkey                      : \"alt+space\"\ncancel-hotkey               : \"shift+esc\"\nmac-floating-waveform       : true\nmac-waveform-gradient-start : \"#b58cff\"\nmac-waveform-gradient-end   : \"#d7e6ff\"\n",
     )
     .context("failed to write default config")
 }

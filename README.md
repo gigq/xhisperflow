@@ -51,6 +51,9 @@ The app uses `Option+Space` by default. Configure it in:
 ~/Library/Application Support/xhisperflow/xhisperflowrc
 ```
 
+Use `cancel-hotkey` to bind a shortcut that discards the current recording
+without transcription. Set it to an empty string to disable the cancel shortcut.
+
 The floating HUD can be disabled with `mac-floating-waveform : false`. Its
 waveform colors are configured with `mac-waveform-gradient-start` and
 `mac-waveform-gradient-end` using quoted `#RRGGBB` values.

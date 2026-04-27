@@ -17,6 +17,7 @@ non-ascii-default-delay : 0.025
 
 # macOS App:
 hotkey                      : "alt+space"
+cancel-hotkey               : "shift+esc"
 mac-floating-waveform       : true
 mac-waveform-gradient-start : "#b58cff"
 mac-waveform-gradient-end   : "#d7e6ff"

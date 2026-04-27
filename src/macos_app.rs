@@ -8,6 +8,11 @@ use cocoa::appkit::NSColor;
 use cocoa::base::{NO, YES, id, nil};
 #[allow(deprecated)]
 use cocoa::foundation::NSPoint;
+use core_foundation::runloop::CFRunLoop;
+use core_graphics::event::{
+    CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
+    CGEventTapProxy, CGEventType, CallbackResult, EventField, KeyCode,
+};
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use enigo::{
     Direction::{Click, Press, Release},
@@ -53,8 +58,9 @@ const HUD_SHOULDER_Y: f64 = 14.0;
 const HUD_SHOULDER_INSET: f64 = 8.0;
 const WAVEFORM_HEIGHT: u32 = 58;
 const WAVEFORM_BOTTOM_PADDING: u32 = 14;
-const WAVEFORM_LEVEL_FLOOR: f32 = 0.06;
-const WAVEFORM_LEVEL_CEILING: f32 = 0.48;
+const WAVEFORM_LEVEL_FLOOR: f32 = 0.10;
+const WAVEFORM_LEVEL_CEILING: f32 = 0.62;
+const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(250);
 const LEVEL_HISTORY: usize = 180;
 
 type HudSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
@@ -87,6 +93,8 @@ pub fn run() -> Result<()> {
 enum UserEvent {
     Menu(MenuEvent),
     HotKey(GlobalHotKeyEvent),
+    OrderIndependentHotKey,
+    OrderIndependentCancelHotKey,
     Worker(WorkerEvent),
 }
 
@@ -102,7 +110,9 @@ struct MacApp {
     menu_ids: MenuIds,
     toggle_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
+    cancel_item: Option<MenuItem>,
     hotkey: HotKey,
+    cancel_hotkey: Option<HotKey>,
     hotkey_manager: GlobalHotKeyManager,
     window: Option<Rc<Window>>,
     window_id: Option<WindowId>,
@@ -112,11 +122,13 @@ struct MacApp {
     state: AppState,
     status: String,
     started_at: Option<Instant>,
+    last_hotkey_at: Option<Instant>,
 }
 
 #[derive(Clone, Debug, Default)]
 struct MenuIds {
     toggle: MenuId,
+    cancel: MenuId,
     open_config: MenuId,
     show_log: MenuId,
     permissions: MenuId,
@@ -140,6 +152,20 @@ impl MacApp {
         hotkey_manager
             .register(hotkey)
             .with_context(|| format!("failed to register hotkey '{}'", config.mac_hotkey))?;
+        let cancel_hotkey = parse_optional_hotkey(&config.mac_cancel_hotkey)?;
+        if let Some(cancel_hotkey) = cancel_hotkey {
+            hotkey_manager.register(cancel_hotkey).with_context(|| {
+                format!(
+                    "failed to register cancel hotkey '{}'",
+                    config.mac_cancel_hotkey
+                )
+            })?;
+        }
+        let toggle_escape_mods = order_independent_escape_mods(hotkey);
+        let cancel_escape_mods = cancel_hotkey.and_then(order_independent_escape_mods);
+        if toggle_escape_mods.is_some() || cancel_escape_mods.is_some() {
+            start_escape_modifier_event_tap(proxy.clone(), toggle_escape_mods, cancel_escape_mods);
+        }
 
         Ok(Self {
             proxy,
@@ -148,7 +174,9 @@ impl MacApp {
             menu_ids: MenuIds::default(),
             toggle_item: None,
             status_item: None,
+            cancel_item: None,
             hotkey,
+            cancel_hotkey,
             hotkey_manager,
             window: None,
             window_id: None,
@@ -158,12 +186,14 @@ impl MacApp {
             state: AppState::Idle,
             status: "Ready".to_string(),
             started_at: None,
+            last_hotkey_at: None,
         })
     }
 
     fn build_tray(&mut self) -> Result<()> {
         let menu = Menu::new();
         let toggle = MenuItem::new("Start Recording", true, None);
+        let cancel = MenuItem::new("Cancel Recording", false, None);
         let status = MenuItem::new("Ready", false, None);
         let open_config = MenuItem::new("Open Config", true, None);
         let show_log = MenuItem::new("Show Log", true, None);
@@ -174,6 +204,7 @@ impl MacApp {
 
         menu.append_items(&[
             &toggle,
+            &cancel,
             &status,
             &separator,
             &open_config,
@@ -186,18 +217,20 @@ impl MacApp {
 
         self.menu_ids = MenuIds {
             toggle: toggle.id().clone(),
+            cancel: cancel.id().clone(),
             open_config: open_config.id().clone(),
             show_log: show_log.id().clone(),
             permissions: permissions.id().clone(),
             quit: quit.id().clone(),
         };
         self.toggle_item = Some(toggle);
+        self.cancel_item = Some(cancel);
         self.status_item = Some(status);
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
             .with_tooltip("xhisperflow")
-            .with_icon(tray_icon_for_state(AppState::Idle)?)
+            .with_icon(tray_icon()?)
             .with_icon_as_template(true)
             .build()
             .context("failed to create menu bar icon")?;
@@ -244,6 +277,8 @@ impl MacApp {
         let id = event.id();
         if id == &self.menu_ids.toggle {
             self.toggle_recording();
+        } else if id == &self.menu_ids.cancel {
+            self.cancel_recording();
         } else if id == &self.menu_ids.open_config {
             self.open_config();
         } else if id == &self.menu_ids.show_log {
@@ -263,6 +298,30 @@ impl MacApp {
                 self.set_status("Busy");
             }
         }
+    }
+
+    fn trigger_hotkey_toggle(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_hotkey_at
+            .is_some_and(|last| now.duration_since(last) < HOTKEY_DEBOUNCE)
+        {
+            return;
+        }
+        self.last_hotkey_at = Some(now);
+        self.toggle_recording();
+    }
+
+    fn trigger_cancel_hotkey(&mut self) {
+        let now = Instant::now();
+        if self
+            .last_hotkey_at
+            .is_some_and(|last| now.duration_since(last) < HOTKEY_DEBOUNCE)
+        {
+            return;
+        }
+        self.last_hotkey_at = Some(now);
+        self.cancel_recording();
     }
 
     fn start_recording(&mut self) {
@@ -320,6 +379,24 @@ impl MacApp {
         }
     }
 
+    fn cancel_recording(&mut self) {
+        let Some(recorder) = self.recorder.take() else {
+            if matches!(self.state, AppState::Transcribing | AppState::Pasting) {
+                self.set_status("Busy");
+            }
+            return;
+        };
+
+        let path = recorder.output_path().to_path_buf();
+        drop(recorder);
+        let _ = fs::remove_file(&path);
+        self.state = AppState::Idle;
+        self.started_at = None;
+        self.clear_levels();
+        self.set_status("Ready");
+        self.show_hud(false);
+    }
+
     fn finish_transcription(&mut self, result: Result<String, String>) {
         match result {
             Ok(text) if text.trim().is_empty() => {
@@ -353,11 +430,6 @@ impl MacApp {
 
     fn set_status(&mut self, status: &str) {
         self.status = status.to_string();
-        if let Some(tray) = &self.tray {
-            if let Ok(icon) = tray_icon_for_state(self.state) {
-                let _ = tray.set_icon(Some(icon));
-            }
-        }
         if let Some(item) = &self.status_item {
             item.set_text(status);
         }
@@ -370,6 +442,9 @@ impl MacApp {
             };
             toggle.set_text(text);
             toggle.set_enabled(matches!(self.state, AppState::Idle | AppState::Recording));
+        }
+        if let Some(cancel) = &self.cancel_item {
+            cancel.set_enabled(matches!(self.state, AppState::Recording));
         }
         if let Some(window) = &self.window {
             window.set_title(&format!("xhisperflow - {status}"));
@@ -507,9 +582,17 @@ impl ApplicationHandler<UserEvent> for MacApp {
             UserEvent::Menu(event) => self.handle_menu(event_loop, event),
             UserEvent::HotKey(event) => {
                 if event.id == self.hotkey.id() && matches!(event.state, HotKeyState::Pressed) {
-                    self.toggle_recording();
+                    self.trigger_hotkey_toggle();
+                } else if self
+                    .cancel_hotkey
+                    .is_some_and(|hotkey| event.id == hotkey.id())
+                    && matches!(event.state, HotKeyState::Pressed)
+                {
+                    self.trigger_cancel_hotkey();
                 }
             }
+            UserEvent::OrderIndependentHotKey => self.trigger_hotkey_toggle(),
+            UserEvent::OrderIndependentCancelHotKey => self.trigger_cancel_hotkey(),
             UserEvent::Worker(WorkerEvent::TranscriptionFinished(result)) => {
                 self.finish_transcription(result);
             }
@@ -555,6 +638,9 @@ impl ApplicationHandler<UserEvent> for MacApp {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         let _ = self.hotkey_manager.unregister(self.hotkey);
+        if let Some(cancel_hotkey) = self.cancel_hotkey {
+            let _ = self.hotkey_manager.unregister(cancel_hotkey);
+        }
         if let Some(recorder) = self.recorder.take() {
             let _ = recorder.stop();
         }
@@ -658,6 +744,10 @@ impl Recorder {
             writer.finalize().context("failed to finalize wav file")?;
         }
         Ok(self.output_path)
+    }
+
+    fn output_path(&self) -> &Path {
+        &self.output_path
     }
 }
 
@@ -837,6 +927,138 @@ fn parse_hotkey(value: &str) -> Result<HotKey> {
             }
         })
         .with_context(|| format!("invalid hotkey '{value}'"))
+}
+
+fn parse_optional_hotkey(value: &str) -> Result<Option<HotKey>> {
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    parse_hotkey(value).map(Some)
+}
+
+fn order_independent_escape_mods(hotkey: HotKey) -> Option<Modifiers> {
+    (hotkey.key == Code::Escape && !hotkey.mods.is_empty()).then_some(hotkey.mods)
+}
+
+#[derive(Default)]
+struct EscapeModifierTapState {
+    escape_down: bool,
+}
+
+fn start_escape_modifier_event_tap(
+    proxy: EventLoopProxy<UserEvent>,
+    toggle_mods: Option<Modifiers>,
+    cancel_mods: Option<Modifiers>,
+) {
+    thread::spawn(move || {
+        let state = Arc::new(Mutex::new(EscapeModifierTapState::default()));
+        let tap_state = state.clone();
+        let event_tap = CGEventTap::new(
+            CGEventTapLocation::Session,
+            CGEventTapPlacement::HeadInsertEventTap,
+            CGEventTapOptions::ListenOnly,
+            vec![
+                CGEventType::KeyDown,
+                CGEventType::KeyUp,
+                CGEventType::FlagsChanged,
+            ],
+            move |proxy_ref, event_type, event| {
+                handle_escape_modifier_tap_event(
+                    proxy_ref,
+                    event_type,
+                    event,
+                    &proxy,
+                    &tap_state,
+                    toggle_mods,
+                    cancel_mods,
+                )
+            },
+        );
+
+        let Ok(event_tap) = event_tap else {
+            eprintln!(
+                "failed to install Escape hotkey key-order listener; falling back to standard hotkey handling"
+            );
+            return;
+        };
+
+        let loop_source = event_tap
+            .mach_port()
+            .create_runloop_source(0)
+            .expect("failed to create Escape hotkey event tap run loop source");
+        CFRunLoop::get_current().add_source(&loop_source, unsafe {
+            core_foundation::runloop::kCFRunLoopCommonModes
+        });
+        event_tap.enable();
+        CFRunLoop::run_current();
+    });
+}
+
+fn handle_escape_modifier_tap_event(
+    _proxy_ref: CGEventTapProxy,
+    event_type: CGEventType,
+    event: &CGEvent,
+    proxy: &EventLoopProxy<UserEvent>,
+    state: &Arc<Mutex<EscapeModifierTapState>>,
+    toggle_mods: Option<Modifiers>,
+    cancel_mods: Option<Modifiers>,
+) -> CallbackResult {
+    let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
+    let mods = modifiers_from_event_flags(event.get_flags());
+
+    match event_type {
+        CGEventType::KeyDown if keycode == KeyCode::ESCAPE => {
+            if event.get_integer_value_field(EventField::KEYBOARD_EVENT_AUTOREPEAT) == 0 {
+                if let Ok(mut state) = state.lock() {
+                    state.escape_down = true;
+                }
+                send_escape_modifier_event(proxy, mods, toggle_mods, cancel_mods);
+            }
+        }
+        CGEventType::KeyUp if keycode == KeyCode::ESCAPE => {
+            if let Ok(mut state) = state.lock() {
+                state.escape_down = false;
+            }
+        }
+        CGEventType::FlagsChanged if !mods.is_empty() => {
+            if state.lock().is_ok_and(|state| state.escape_down) {
+                send_escape_modifier_event(proxy, mods, toggle_mods, cancel_mods);
+            }
+        }
+        _ => {}
+    }
+
+    CallbackResult::Keep
+}
+
+fn send_escape_modifier_event(
+    proxy: &EventLoopProxy<UserEvent>,
+    mods: Modifiers,
+    toggle_mods: Option<Modifiers>,
+    cancel_mods: Option<Modifiers>,
+) {
+    if Some(mods) == cancel_mods {
+        let _ = proxy.send_event(UserEvent::OrderIndependentCancelHotKey);
+    } else if Some(mods) == toggle_mods {
+        let _ = proxy.send_event(UserEvent::OrderIndependentHotKey);
+    }
+}
+
+fn modifiers_from_event_flags(flags: CGEventFlags) -> Modifiers {
+    let mut mods = Modifiers::empty();
+    if flags.contains(CGEventFlags::CGEventFlagShift) {
+        mods |= Modifiers::SHIFT;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagControl) {
+        mods |= Modifiers::CONTROL;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagAlternate) {
+        mods |= Modifiers::ALT;
+    }
+    if flags.contains(CGEventFlags::CGEventFlagCommand) {
+        mods |= Modifiers::SUPER;
+    }
+    mods
 }
 
 fn draw_waveform(
@@ -1121,30 +1343,17 @@ fn rgb(r: u32, g: u32, b: u32) -> u32 {
     b | (g << 8) | (r << 16)
 }
 
-fn tray_icon_for_state(state: AppState) -> Result<Icon> {
+fn tray_icon() -> Result<Icon> {
     let width = 22_usize;
     let height = 18_usize;
     let mut rgba = vec![0_u8; width * height * 4];
-    let bars = match state {
-        AppState::Recording => [3, 7, 12, 15, 10, 6, 13, 16, 9, 5, 11],
-        AppState::Transcribing | AppState::Pasting => [4, 5, 7, 9, 12, 14, 12, 9, 7, 5, 4],
-        AppState::Idle => [3, 5, 8, 11, 8, 5, 3, 5, 8, 5, 3],
-    };
+    let bars = [2, 4, 6, 11, 14, 11, 8, 5, 7, 5, 3];
 
     for (bar_index, bar_height) in bars.iter().enumerate() {
         let x = 1 + bar_index * 2;
         let top = (height - *bar_height) / 2;
         for y in top..top + *bar_height {
             set_icon_pixel(&mut rgba, width, x, y);
-            if *bar_height > 10 {
-                set_icon_pixel(&mut rgba, width, x + 1, y);
-            }
-        }
-    }
-
-    if matches!(state, AppState::Recording) {
-        for y in 3..15 {
-            set_icon_pixel(&mut rgba, width, 20, y);
         }
     }
 
