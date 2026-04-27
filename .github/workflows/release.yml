@@ -1,0 +1,165 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Derive release version
+        run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
+
+      - name: Build Linux binaries
+        run: cargo build --release --bin xhisperflow --bin xhisperflowtool --bin xhisperflowtoold
+
+      - name: Package Linux release
+        run: |
+          PACKAGE="xhisperflow-${RELEASE_VERSION}-linux-x86_64"
+          mkdir -p "dist/$PACKAGE"
+          cp target/release/xhisperflow "dist/$PACKAGE/"
+          cp target/release/xhisperflowtool "dist/$PACKAGE/"
+          cp target/release/xhisperflowtoold "dist/$PACKAGE/"
+          cp default_xhisperflowrc "dist/$PACKAGE/"
+          tar -C dist -czf "dist/$PACKAGE.tar.gz" "$PACKAGE"
+          shasum -a 256 "dist/$PACKAGE.tar.gz" > "dist/$PACKAGE.tar.gz.sha256"
+
+      - name: Upload Linux artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: linux-release
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+
+  macos:
+    runs-on: macos-14
+
+    env:
+      VERSION: ${{ github.ref_name }}
+      BUILD_NUMBER: ${{ github.run_number }}
+      APPLE_DEVELOPER_ID_APP_CERT_BASE64: ${{ secrets.APPLE_DEVELOPER_ID_APP_CERT_BASE64 }}
+      APPLE_DEVELOPER_ID_APP_CERT_PASSWORD: ${{ secrets.APPLE_DEVELOPER_ID_APP_CERT_PASSWORD }}
+      APPLE_BUILD_KEYCHAIN_PASSWORD: ${{ secrets.APPLE_BUILD_KEYCHAIN_PASSWORD }}
+      APPLE_DEVELOPER_ID_APPLICATION: ${{ secrets.APPLE_DEVELOPER_ID_APPLICATION }}
+      APPLE_ID: ${{ secrets.APPLE_ID }}
+      APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+      APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - name: Select Xcode
+        uses: maxim-lobanov/setup-xcode@v1
+        with:
+          xcode-version: latest-stable
+
+      - name: Derive release version
+        run: echo "RELEASE_VERSION=${VERSION#v}" >> "$GITHUB_ENV"
+
+      - name: Import Developer ID certificate
+        if: ${{ env.APPLE_DEVELOPER_ID_APP_CERT_BASE64 != '' }}
+        run: |
+          KEYCHAIN_PATH="$RUNNER_TEMP/xhisperflow-build.keychain-db"
+          CERT_PATH="$RUNNER_TEMP/developer-id.p12"
+
+          echo "$APPLE_DEVELOPER_ID_APP_CERT_BASE64" | base64 --decode > "$CERT_PATH"
+
+          security create-keychain -p "$APPLE_BUILD_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$APPLE_BUILD_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security import "$CERT_PATH" -P "$APPLE_DEVELOPER_ID_APP_CERT_PASSWORD" -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security list-keychains -d user -s "$KEYCHAIN_PATH"
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$APPLE_BUILD_KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+      - name: Build universal app bundle
+        env:
+          ARCHS: aarch64 x86_64
+          VERSION: ${{ env.RELEASE_VERSION }}
+          BUILD_NUMBER: ${{ env.BUILD_NUMBER }}
+          APP_DIR: ${{ github.workspace }}/.build/app/xhisperflow.app
+          SIGNING_IDENTITY: ${{ env.APPLE_DEVELOPER_ID_APPLICATION != '' && env.APPLE_DEVELOPER_ID_APPLICATION || '-' }}
+          ENABLE_HARDENED_RUNTIME: ${{ env.APPLE_DEVELOPER_ID_APPLICATION != '' && '1' || '0' }}
+        run: ./scripts/build-macos-app.sh
+
+      - name: Build DMG
+        env:
+          VERSION: ${{ env.RELEASE_VERSION }}
+          APP_DIR: ${{ github.workspace }}/.build/app/xhisperflow.app
+          DIST_DIR: ${{ github.workspace }}/dist
+          DMG_NAME: xhisperflow-${{ env.RELEASE_VERSION }}-universal.dmg
+          SIGNING_IDENTITY: ${{ env.APPLE_DEVELOPER_ID_APPLICATION != '' && env.APPLE_DEVELOPER_ID_APPLICATION || '-' }}
+        run: ./scripts/build-macos-dmg.sh
+
+      - name: Notarize DMG
+        if: ${{ env.APPLE_DEVELOPER_ID_APPLICATION != '' && env.APPLE_ID != '' && env.APPLE_APP_SPECIFIC_PASSWORD != '' && env.APPLE_TEAM_ID != '' }}
+        run: |
+          DMG_PATH="dist/xhisperflow-${RELEASE_VERSION}-universal.dmg"
+          xcrun notarytool store-credentials "xhisperflow-notary" \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID"
+          xcrun notarytool submit "$DMG_PATH" \
+            --keychain-profile "xhisperflow-notary" \
+            --wait
+          xcrun stapler staple "$DMG_PATH"
+
+      - name: Generate macOS checksums
+        run: |
+          cd dist
+          shasum -a 256 "xhisperflow-${RELEASE_VERSION}-universal.dmg" > "xhisperflow-${RELEASE_VERSION}-universal.dmg.sha256"
+
+      - name: Upload macOS artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: macos-release
+          path: |
+            dist/*.dmg
+            dist/*.dmg.sha256
+
+  publish:
+    runs-on: ubuntu-latest
+    needs:
+      - linux
+      - macos
+
+    steps:
+      - name: Download release artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub release assets
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          RELEASE_VERSION="${TAG#v}"
+          ASSETS=(dist/*)
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          else
+            gh release create "$TAG" "${ASSETS[@]}" \
+              --title "xhisperflow ${RELEASE_VERSION}" \
+              --generate-notes
+          fi

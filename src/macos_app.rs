@@ -1,5 +1,5 @@
 use crate::app::{LOG_PATH, load_home_env, log_timed_step, post_process, sleep_secs, transcribe};
-use crate::config::{Config, config_file_path};
+use crate::config::{Config, config_file_path, home_dir};
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
 #[allow(deprecated)]
@@ -62,6 +62,7 @@ const WAVEFORM_LEVEL_FLOOR: f32 = 0.10;
 const WAVEFORM_LEVEL_CEILING: f32 = 0.62;
 const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(250);
 const LEVEL_HISTORY: usize = 180;
+const LOGIN_AGENT_LABEL: &str = "com.gigq.xhisperflow";
 
 type HudSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
@@ -111,6 +112,7 @@ struct MacApp {
     toggle_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
     cancel_item: Option<MenuItem>,
+    login_item: Option<MenuItem>,
     hotkey: HotKey,
     cancel_hotkey: Option<HotKey>,
     hotkey_manager: GlobalHotKeyManager,
@@ -129,6 +131,7 @@ struct MacApp {
 struct MenuIds {
     toggle: MenuId,
     cancel: MenuId,
+    login: Option<MenuId>,
     open_config: MenuId,
     show_log: MenuId,
     permissions: MenuId,
@@ -175,6 +178,7 @@ impl MacApp {
             toggle_item: None,
             status_item: None,
             cancel_item: None,
+            login_item: None,
             hotkey,
             cancel_hotkey,
             hotkey_manager,
@@ -197,6 +201,7 @@ impl MacApp {
         let status = MenuItem::new("Ready", false, None);
         let open_config = MenuItem::new("Open Config", true, None);
         let show_log = MenuItem::new("Show Log", true, None);
+        let login = (!login_agent_enabled()).then(|| MenuItem::new("Start at Login", true, None));
         let permissions = MenuItem::new("Permissions Help", true, None);
         let quit = MenuItem::new("Quit", true, None);
         let separator = PredefinedMenuItem::separator();
@@ -209,15 +214,19 @@ impl MacApp {
             &separator,
             &open_config,
             &show_log,
-            &permissions,
-            &separator_two,
-            &quit,
         ])
         .context("failed to build tray menu")?;
+        if let Some(login) = &login {
+            menu.append(login)
+                .context("failed to append start at login menu item")?;
+        }
+        menu.append_items(&[&permissions, &separator_two, &quit])
+            .context("failed to finish tray menu")?;
 
         self.menu_ids = MenuIds {
             toggle: toggle.id().clone(),
             cancel: cancel.id().clone(),
+            login: login.as_ref().map(|item| item.id().clone()),
             open_config: open_config.id().clone(),
             show_log: show_log.id().clone(),
             permissions: permissions.id().clone(),
@@ -226,6 +235,7 @@ impl MacApp {
         self.toggle_item = Some(toggle);
         self.cancel_item = Some(cancel);
         self.status_item = Some(status);
+        self.login_item = login;
 
         let tray = TrayIconBuilder::new()
             .with_menu(Box::new(menu))
@@ -283,6 +293,13 @@ impl MacApp {
             self.open_config();
         } else if id == &self.menu_ids.show_log {
             self.open_path(Path::new(LOG_PATH));
+        } else if self
+            .menu_ids
+            .login
+            .as_ref()
+            .is_some_and(|login| id == login)
+        {
+            self.toggle_start_at_login();
         } else if id == &self.menu_ids.permissions {
             self.open_permissions_help();
         } else if id == &self.menu_ids.quit {
@@ -506,6 +523,24 @@ impl MacApp {
             "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
         ] {
             let _ = std::process::Command::new("open").arg(url).status();
+        }
+    }
+
+    fn toggle_start_at_login(&mut self) {
+        let result = if login_agent_enabled() {
+            disable_start_at_login()
+        } else {
+            enable_start_at_login()
+        };
+
+        match result {
+            Ok(()) => {
+                if let Some(login) = &self.login_item {
+                    login.set_enabled(false);
+                    login.set_text("Start at Login Enabled");
+                }
+            }
+            Err(err) => self.set_status(&format!("Login item failed: {err:#}")),
         }
     }
 
@@ -901,6 +936,107 @@ fn paste_text(config: &Config, text: &str) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn login_agent_enabled() -> bool {
+    login_agent_path().exists()
+}
+
+fn enable_start_at_login() -> Result<()> {
+    let path = login_agent_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).context("failed to create LaunchAgents directory")?;
+    }
+    fs::write(&path, login_agent_plist()?)
+        .with_context(|| format!("failed to write {}", path.display()))
+}
+
+fn disable_start_at_login() -> Result<()> {
+    let path = login_agent_path();
+    if path.exists() {
+        fs::remove_file(&path).with_context(|| format!("failed to remove {}", path.display()))?;
+    }
+    Ok(())
+}
+
+fn login_agent_path() -> PathBuf {
+    home_dir()
+        .join("Library")
+        .join("LaunchAgents")
+        .join(format!("{LOGIN_AGENT_LABEL}.plist"))
+}
+
+fn login_agent_plist() -> Result<String> {
+    let args = login_program_arguments()?;
+    let args = args
+        .iter()
+        .map(|arg| format!("    <string>{}</string>", xml_escape(arg)))
+        .collect::<Vec<_>>()
+        .join("\n");
+    Ok(format!(
+        r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>{}</string>
+  <key>ProgramArguments</key>
+  <array>
+{}
+  </array>
+  <key>RunAtLoad</key>
+  <true/>
+</dict>
+</plist>
+"#,
+        LOGIN_AGENT_LABEL, args
+    ))
+}
+
+fn login_program_arguments() -> Result<Vec<String>> {
+    let exe = std::env::current_exe().context("failed to resolve current executable")?;
+    if let Some(app_bundle) = exe.ancestors().find(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    }) {
+        return Ok(vec![
+            "/usr/bin/open".to_string(),
+            "-a".to_string(),
+            app_bundle.display().to_string(),
+        ]);
+    }
+    Ok(vec![login_launcher_path(&exe)?.display().to_string()])
+}
+
+fn login_launcher_path(exe: &Path) -> Result<PathBuf> {
+    let launcher = home_dir()
+        .join("Library")
+        .join("Application Support")
+        .join("xhisperflow")
+        .join("xhisperflow");
+    if let Some(parent) = launcher.parent() {
+        fs::create_dir_all(parent)
+            .context("failed to create xhisperflow application support directory")?;
+    }
+
+    if launcher.exists() {
+        fs::remove_file(&launcher)
+            .with_context(|| format!("failed to replace {}", launcher.display()))?;
+    }
+    std::os::unix::fs::symlink(exe, &launcher)
+        .with_context(|| format!("failed to create {}", launcher.display()))?;
+    Ok(launcher)
+}
+
+fn xml_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&apos;")
 }
 
 fn parse_hotkey(value: &str) -> Result<HotKey> {

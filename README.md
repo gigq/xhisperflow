@@ -24,6 +24,17 @@ This produces:
 - `target/debug/xhisperflowtool`
 - `target/debug/xhisperflowtoold`
 
+## Release builds
+
+GitHub release builds run when a `v*` tag is pushed:
+
+```sh
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+The release workflow publishes a Linux tarball and a universal macOS DMG.
+
 ## Runtime dependencies
 
 - `pw-record`
@@ -57,6 +68,9 @@ without transcription. Set it to an empty string to disable the cancel shortcut.
 The floating HUD can be disabled with `mac-floating-waveform : false`. Its
 waveform colors are configured with `mac-waveform-gradient-start` and
 `mac-waveform-gradient-end` using quoted `#RRGGBB` values.
+
+Use the menu bar app's Start at Login item to install a per-user LaunchAgent
+for the current app.
 
 Required macOS permissions:
 
