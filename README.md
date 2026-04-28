@@ -80,6 +80,10 @@ Required macOS permissions:
 - Microphone, for recording.
 - Accessibility, for pasting the final transcript with Command+V.
 
+On launch, the app checks Accessibility access. If it is missing, xhisperflow
+shows a setup prompt with the required steps, then opens the Accessibility page
+in System Settings.
+
 The menu bar app includes a Permissions Help item that opens the relevant
 System Settings panes. If Accessibility paste is not allowed, the transcript is
 left on the clipboard.

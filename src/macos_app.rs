@@ -7,7 +7,7 @@ use cocoa::appkit::NSColor;
 #[allow(deprecated)]
 use cocoa::base::{NO, YES, id, nil};
 #[allow(deprecated)]
-use cocoa::foundation::NSPoint;
+use cocoa::foundation::{NSPoint, NSString};
 use core_foundation::runloop::CFRunLoop;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -48,6 +48,13 @@ use winit::event_loop::{
 };
 use winit::platform::macos::WindowAttributesExtMacOS;
 use winit::window::{Window, WindowAttributes, WindowId, WindowLevel};
+
+type Boolean = u8;
+
+#[link(name = "ApplicationServices", kind = "framework")]
+unsafe extern "C" {
+    fn AXIsProcessTrusted() -> Boolean;
+}
 
 const MAC_RECORDING_PATH: &str = "/tmp/xhisperflow-mac.wav";
 const HUD_WIDTH: u32 = 360;
@@ -127,6 +134,7 @@ struct MacApp {
     status: String,
     started_at: Option<Instant>,
     last_hotkey_at: Option<Instant>,
+    accessibility_prompted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -228,6 +236,7 @@ impl MacApp {
             status: "Ready".to_string(),
             started_at: None,
             last_hotkey_at: None,
+            accessibility_prompted: false,
         })
     }
 
@@ -554,13 +563,33 @@ impl MacApp {
         }
     }
 
-    fn open_permissions_help(&self) {
-        for url in [
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Microphone",
-            "x-apple.systempreferences:com.apple.preference.security?Privacy_Accessibility",
-        ] {
-            let _ = std::process::Command::new("open").arg(url).status();
+    fn maybe_prompt_for_accessibility_permission(&mut self) {
+        if self.accessibility_prompted || accessibility_permission_granted() {
+            return;
         }
+
+        self.accessibility_prompted = true;
+        self.set_status("Accessibility permission required");
+        show_accessibility_permission_prompt();
+        self.open_accessibility_settings();
+    }
+
+    fn open_permissions_help(&self) {
+        self.open_microphone_settings();
+        self.open_accessibility_settings();
+    }
+
+    fn open_accessibility_settings(&self) {
+        self.open_system_settings_privacy_pane("Privacy_Accessibility");
+    }
+
+    fn open_microphone_settings(&self) {
+        self.open_system_settings_privacy_pane("Privacy_Microphone");
+    }
+
+    fn open_system_settings_privacy_pane(&self, pane: &str) {
+        let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+        let _ = std::process::Command::new("open").arg(url).status();
     }
 
     fn toggle_start_at_login(&mut self) {
@@ -647,6 +676,7 @@ impl ApplicationHandler<UserEvent> for MacApp {
         if std::env::var_os("XHISPERFLOW_HUD_PREVIEW").is_some() {
             self.show_preview_hud();
         }
+        self.maybe_prompt_for_accessibility_permission();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -950,6 +980,39 @@ fn write_input<I>(
             levels.pop_front();
         }
         levels.push_back(smoothed);
+    }
+}
+
+fn accessibility_permission_granted() -> bool {
+    unsafe { AXIsProcessTrusted() != 0 }
+}
+
+#[allow(deprecated)]
+fn show_accessibility_permission_prompt() {
+    unsafe {
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+
+        let alert: id = msg_send![class!(NSAlert), new];
+        let message = NSString::alloc(nil).init_str("xhisperflow Needs Accessibility Access");
+        let info = NSString::alloc(nil).init_str(
+            "xhisperflow uses Accessibility to paste finished transcripts into the active app.\n\n\
+            Click OK, then in System Settings > Privacy & Security > Accessibility:\n\
+            1. Add /Applications/xhisperflow.app if it is not listed.\n\
+            2. Turn xhisperflow on.\n\
+            3. Quit and reopen xhisperflow if macOS asks.",
+        );
+        let ok = NSString::alloc(nil).init_str("OK");
+
+        let _: () = msg_send![alert, setMessageText: message];
+        let _: () = msg_send![alert, setInformativeText: info];
+        let _: id = msg_send![alert, addButtonWithTitle: ok];
+        let _: i64 = msg_send![alert, runModal];
+
+        let _: () = msg_send![message, release];
+        let _: () = msg_send![info, release];
+        let _: () = msg_send![ok, release];
+        let _: () = msg_send![alert, release];
     }
 }
 
