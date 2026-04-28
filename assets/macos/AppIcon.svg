@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <defs>
+    <linearGradient id="tile" x1="176" y1="104" x2="848" y2="920" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#F7FAFC"/>
+      <stop offset="0.45" stop-color="#EAF1F8"/>
+      <stop offset="1" stop-color="#CBD7E5"/>
+    </linearGradient>
+    <linearGradient id="wave" x1="260" y1="310" x2="770" y2="714" gradientUnits="userSpaceOnUse">
+      <stop offset="0" stop-color="#0EA5E9"/>
+      <stop offset="0.52" stop-color="#10B981"/>
+      <stop offset="1" stop-color="#1E293B"/>
+    </linearGradient>
+    <filter id="shadow" x="96" y="72" width="832" height="888" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="34" stdDeviation="38" flood-color="#0F172A" flood-opacity="0.22"/>
+      <feDropShadow dx="0" dy="4" stdDeviation="10" flood-color="#0F172A" flood-opacity="0.12"/>
+    </filter>
+    <filter id="barShadow" x="198" y="228" width="628" height="568" filterUnits="userSpaceOnUse" color-interpolation-filters="sRGB">
+      <feDropShadow dx="0" dy="14" stdDeviation="18" flood-color="#0F172A" flood-opacity="0.2"/>
+    </filter>
+  </defs>
+
+  <rect x="128" y="104" width="768" height="816" rx="188" fill="url(#tile)" filter="url(#shadow)"/>
+  <rect x="176" y="152" width="672" height="720" rx="148" fill="none" stroke="#FFFFFF" stroke-width="24" stroke-opacity="0.72"/>
+
+  <g filter="url(#barShadow)">
+    <rect x="246" y="470" width="34" height="84" rx="17" fill="url(#wave)"/>
+    <rect x="300" y="428" width="34" height="168" rx="17" fill="url(#wave)"/>
+    <rect x="354" y="386" width="34" height="252" rx="17" fill="url(#wave)"/>
+    <rect x="408" y="280" width="34" height="464" rx="17" fill="url(#wave)"/>
+    <rect x="462" y="214" width="34" height="596" rx="17" fill="url(#wave)"/>
+    <rect x="516" y="280" width="34" height="464" rx="17" fill="url(#wave)"/>
+    <rect x="570" y="344" width="34" height="336" rx="17" fill="url(#wave)"/>
+    <rect x="624" y="408" width="34" height="208" rx="17" fill="url(#wave)"/>
+    <rect x="678" y="366" width="34" height="292" rx="17" fill="url(#wave)"/>
+    <rect x="732" y="408" width="34" height="208" rx="17" fill="url(#wave)"/>
+    <rect x="786" y="450" width="34" height="124" rx="17" fill="url(#wave)"/>
+  </g>
+</svg>

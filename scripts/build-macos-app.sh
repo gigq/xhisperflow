@@ -8,6 +8,9 @@ BUILD_DIR="${BUILD_DIR:-$ROOT_DIR/target}"
 APP_DIR="${APP_DIR:-$BUILD_DIR/$APP_NAME.app}"
 CONTENTS_DIR="$APP_DIR/Contents"
 MACOS_DIR="$CONTENTS_DIR/MacOS"
+RESOURCES_DIR="$CONTENTS_DIR/Resources"
+ICON_FILE="AppIcon.icns"
+ICON_SOURCE="$ROOT_DIR/assets/macos/$ICON_FILE"
 ARCHS="${ARCHS:-native}"
 VERSION="${VERSION:-$(awk -F ' *= *' '$1 == "version" { gsub(/"/, "", $2); print $2; exit }' "$ROOT_DIR/Cargo.toml")}"
 BUILD_NUMBER="${BUILD_NUMBER:-1}"
@@ -72,7 +75,7 @@ for executable_path in "${executable_slices[@]}"; do
 done
 
 rm -rf "$APP_DIR"
-mkdir -p "$MACOS_DIR"
+mkdir -p "$MACOS_DIR" "$RESOURCES_DIR"
 
 if [[ "${#executable_slices[@]}" -eq 1 ]]; then
   cp "${executable_slices[0]}" "$MACOS_DIR/$APP_NAME"
@@ -81,6 +84,7 @@ else
 fi
 
 chmod +x "$MACOS_DIR/$APP_NAME"
+cp "$ICON_SOURCE" "$RESOURCES_DIR/$ICON_FILE"
 
 cat > "$CONTENTS_DIR/Info.plist" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
@@ -92,6 +96,8 @@ cat > "$CONTENTS_DIR/Info.plist" <<PLIST
   <string>en</string>
   <key>CFBundleExecutable</key>
   <string>$APP_NAME</string>
+  <key>CFBundleIconFile</key>
+  <string>AppIcon</string>
   <key>CFBundleIdentifier</key>
   <string>$BUNDLE_ID</string>
   <key>CFBundleInfoDictionaryVersion</key>
