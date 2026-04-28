@@ -81,8 +81,9 @@ Required macOS permissions:
 - Accessibility, for pasting the final transcript with Command+V.
 
 On launch, the app checks Accessibility access. If it is missing, xhisperflow
-shows a setup prompt with the required steps, then opens the Accessibility page
-in System Settings.
+shows a setup prompt. Clicking Allow opens the Accessibility page in System
+Settings and keeps a helper window visible with the app path to drag into the
+permission list.
 
 The menu bar app includes a Permissions Help item that opens the relevant
 System Settings panes. If Accessibility paste is not allowed, the transcript is

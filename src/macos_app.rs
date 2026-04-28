@@ -3,11 +3,11 @@ use crate::config::{Config, config_file_path, home_dir};
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
 #[allow(deprecated)]
-use cocoa::appkit::NSColor;
+use cocoa::appkit::{NSBackingStoreBuffered, NSColor, NSWindowStyleMask};
 #[allow(deprecated)]
 use cocoa::base::{NO, YES, id, nil};
 #[allow(deprecated)]
-use cocoa::foundation::{NSPoint, NSString};
+use cocoa::foundation::{NSPoint, NSRect, NSSize, NSString};
 use core_foundation::runloop::CFRunLoop;
 use core_graphics::event::{
     CGEvent, CGEventFlags, CGEventTap, CGEventTapLocation, CGEventTapOptions, CGEventTapPlacement,
@@ -23,6 +23,8 @@ use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
 };
 use hound::{SampleFormat as WavSampleFormat, WavSpec, WavWriter};
+use objc::declare::ClassDecl;
+use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use softbuffer::Surface;
@@ -31,9 +33,10 @@ use std::ffi::c_void;
 use std::fs::{self, File};
 use std::io::BufWriter;
 use std::num::NonZeroU32;
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::{
@@ -564,14 +567,17 @@ impl MacApp {
     }
 
     fn maybe_prompt_for_accessibility_permission(&mut self) {
-        if self.accessibility_prompted || accessibility_permission_granted() {
+        let force_prompt = std::env::var_os("XHISPERFLOW_ACCESSIBILITY_PROMPT_PREVIEW").is_some();
+        if self.accessibility_prompted || (!force_prompt && accessibility_permission_granted()) {
             return;
         }
 
         self.accessibility_prompted = true;
         self.set_status("Accessibility permission required");
-        show_accessibility_permission_prompt();
-        self.open_accessibility_settings();
+        if catch_unwind(AssertUnwindSafe(show_accessibility_permission_prompt)).is_err() {
+            eprintln!("failed to show Accessibility permission prompt");
+            open_system_settings_privacy_pane("Privacy_Accessibility");
+        }
     }
 
     fn open_permissions_help(&self) {
@@ -588,8 +594,7 @@ impl MacApp {
     }
 
     fn open_system_settings_privacy_pane(&self, pane: &str) {
-        let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
-        let _ = std::process::Command::new("open").arg(url).status();
+        open_system_settings_privacy_pane(pane);
     }
 
     fn toggle_start_at_login(&mut self) {
@@ -993,27 +998,297 @@ fn show_accessibility_permission_prompt() {
         let app: id = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, activateIgnoringOtherApps: YES];
 
-        let alert: id = msg_send![class!(NSAlert), new];
-        let message = NSString::alloc(nil).init_str("xhisperflow Needs Accessibility Access");
-        let info = NSString::alloc(nil).init_str(
-            "xhisperflow uses Accessibility to paste finished transcripts into the active app.\n\n\
-            Click OK, then in System Settings > Privacy & Security > Accessibility:\n\
-            1. Add /Applications/xhisperflow.app if it is not listed.\n\
-            2. Turn xhisperflow on.\n\
-            3. Quit and reopen xhisperflow if macOS asks.",
+        let window = make_setup_window(
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 410.0)),
+            "Enable xhisperflow",
         );
-        let ok = NSString::alloc(nil).init_str("OK");
+        let content: id = msg_send![window, contentView];
 
-        let _: () = msg_send![alert, setMessageText: message];
-        let _: () = msg_send![alert, setInformativeText: info];
-        let _: id = msg_send![alert, addButtonWithTitle: ok];
-        let _: i64 = msg_send![alert, runModal];
+        let icon = make_app_icon_view(316.0, 268.0, 88.0, 88.0);
+        let title = make_label("Enable xhisperflow", 0.0, 220.0, 720.0, 42.0, 30.0, true);
+        let body = make_label(
+            "xhisperflow needs these permissions to record and paste transcripts on your Mac.",
+            80.0,
+            178.0,
+            560.0,
+            46.0,
+            16.0,
+            false,
+        );
+        let access_row = make_rounded_box(58.0, 90.0, 604.0, 82.0, 18.0);
+        let access_icon = make_accessibility_icon_label(80.0, 106.0);
+        let access_title = make_label("Accessibility", 156.0, 124.0, 260.0, 24.0, 18.0, true);
+        let access_detail = make_label(
+            "Allows xhisperflow to paste into the active app",
+            156.0,
+            101.0,
+            350.0,
+            22.0,
+            14.0,
+            false,
+        );
+        let allow = make_allow_button(572.0, 112.0, 74.0, 32.0);
 
-        let _: () = msg_send![message, release];
-        let _: () = msg_send![info, release];
-        let _: () = msg_send![ok, release];
-        let _: () = msg_send![alert, release];
+        add_subviews(
+            content,
+            &[
+                icon,
+                title,
+                body,
+                access_row,
+                access_icon,
+                access_title,
+                access_detail,
+                allow,
+            ],
+        );
+        let _: () = msg_send![window, center];
+        let _: () = msg_send![window, makeKeyAndOrderFront: nil];
     }
+}
+
+#[allow(deprecated)]
+fn make_setup_window(frame: NSRect, title: &str) -> id {
+    unsafe {
+        let style = NSWindowStyleMask::NSTitledWindowMask
+            | NSWindowStyleMask::NSClosableWindowMask
+            | NSWindowStyleMask::NSFullSizeContentViewWindowMask;
+        let window: id = msg_send![class!(NSWindow), alloc];
+        let window: id = msg_send![
+            window,
+            initWithContentRect: frame
+            styleMask: style
+            backing: NSBackingStoreBuffered
+            defer: NO
+        ];
+        let title = NSString::alloc(nil).init_str(title);
+        let _: () = msg_send![window, setTitle: title];
+        let _: () = msg_send![window, setReleasedWhenClosed: NO];
+        let _: () = msg_send![window, setTitlebarAppearsTransparent: YES];
+        let _: () = msg_send![window, setMovableByWindowBackground: YES];
+        window
+    }
+}
+
+#[allow(deprecated)]
+fn make_label(text: &str, x: f64, y: f64, width: f64, height: f64, size: f64, bold: bool) -> id {
+    unsafe {
+        let text = NSString::alloc(nil).init_str(text);
+        let label: id = msg_send![class!(NSTextField), labelWithString: text];
+        let font: id = if bold {
+            msg_send![class!(NSFont), boldSystemFontOfSize: size]
+        } else {
+            msg_send![class!(NSFont), systemFontOfSize: size]
+        };
+        let _: () = msg_send![
+            label,
+            setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        let _: () = msg_send![label, setFont: font];
+        let _: () = msg_send![label, setAlignment: if x == 0.0 { 2_i64 } else { 0_i64 }];
+        let _: () = msg_send![label, setLineBreakMode: 0_u64];
+        label
+    }
+}
+
+#[allow(deprecated)]
+fn make_accessibility_icon_label(x: f64, y: f64) -> id {
+    unsafe {
+        let view: id = msg_send![class!(NSView), alloc];
+        let view: id = msg_send![
+            view,
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(58.0, 58.0))
+        ];
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let layer: id = msg_send![view, layer];
+        let color: id = msg_send![class!(NSColor), systemBlueColor];
+        let cg_color: *const c_void = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg_color];
+        let _: () = msg_send![layer, setCornerRadius: 29.0_f64];
+
+        let glyph = make_label("A", 0.0, 12.0, 58.0, 34.0, 28.0, true);
+        let white: id = msg_send![class!(NSColor), whiteColor];
+        let _: () = msg_send![glyph, setTextColor: white];
+        let _: () = msg_send![view, addSubview: glyph];
+        view
+    }
+}
+
+#[allow(deprecated)]
+fn make_app_icon_view(x: f64, y: f64, width: f64, height: f64) -> id {
+    unsafe {
+        let workspace: id = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let image: id = msg_send![
+            workspace,
+            iconForFile: NSString::alloc(nil).init_str("/Applications/xhisperflow.app")
+        ];
+        let image_view: id = msg_send![class!(NSImageView), imageViewWithImage: image];
+        let _: () = msg_send![
+            image_view,
+            setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        image_view
+    }
+}
+
+#[allow(deprecated)]
+fn make_rounded_box(x: f64, y: f64, width: f64, height: f64, radius: f64) -> id {
+    unsafe {
+        let view: id = msg_send![class!(NSView), alloc];
+        let view: id = msg_send![
+            view,
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let layer: id = msg_send![view, layer];
+        let color: id = msg_send![class!(NSColor), controlBackgroundColor];
+        let cg_color: *const c_void = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg_color];
+        let _: () = msg_send![layer, setCornerRadius: radius];
+        view
+    }
+}
+
+#[allow(deprecated)]
+fn make_allow_button(x: f64, y: f64, width: f64, height: f64) -> id {
+    unsafe {
+        let title = NSString::alloc(nil).init_str("Allow");
+        let key = NSString::alloc(nil).init_str("\r");
+        let button: id = msg_send![
+            class!(NSButton),
+            buttonWithTitle: title
+            target: permission_setup_controller()
+            action: sel!(openAccessibilityFromPermissionWindow:)
+        ];
+        let _: () = msg_send![
+            button,
+            setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        let _: () = msg_send![button, setBezelStyle: 1_u64];
+        let _: () = msg_send![button, setKeyEquivalent: key];
+        button
+    }
+}
+
+fn add_subviews(content: id, views: &[id]) {
+    unsafe {
+        for view in views {
+            let _: () = msg_send![content, addSubview: *view];
+        }
+    }
+}
+
+fn permission_setup_controller() -> id {
+    static INIT: Once = Once::new();
+    static mut CONTROLLER: id = nil;
+
+    unsafe {
+        INIT.call_once(|| {
+            let class = permission_setup_controller_class();
+            CONTROLLER = msg_send![class, new];
+        });
+        CONTROLLER
+    }
+}
+
+fn permission_setup_controller_class() -> *const Class {
+    static INIT: Once = Once::new();
+    static mut CLASS: *const Class = std::ptr::null();
+
+    unsafe {
+        INIT.call_once(|| {
+            if let Some(existing) = Class::get("XhisperflowPermissionSetupController") {
+                CLASS = existing;
+                return;
+            }
+
+            let superclass = class!(NSObject);
+            if let Some(mut decl) =
+                ClassDecl::new("XhisperflowPermissionSetupController", superclass)
+            {
+                decl.add_method(
+                    sel!(openAccessibilityFromPermissionWindow:),
+                    open_accessibility_from_permission_window as extern "C" fn(&Object, Sel, id),
+                );
+                CLASS = decl.register();
+            }
+        });
+        CLASS
+    }
+}
+
+extern "C" fn open_accessibility_from_permission_window(_: &Object, _: Sel, sender: id) {
+    unsafe {
+        let window: id = msg_send![sender, window];
+        let _: () = msg_send![window, orderOut: nil];
+    }
+    open_system_settings_privacy_pane("Privacy_Accessibility");
+    show_accessibility_drag_helper_panel();
+}
+
+#[allow(deprecated)]
+fn show_accessibility_drag_helper_panel() {
+    unsafe {
+        let panel = make_setup_window(
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(740.0, 150.0)),
+            "Add xhisperflow to Accessibility",
+        );
+        let _: () = msg_send![panel, setLevel: 3_i64];
+        let content: id = msg_send![panel, contentView];
+
+        let arrow = make_label("^", 44.0, 76.0, 64.0, 32.0, 24.0, true);
+        let instruction = make_label(
+            "Drag xhisperflow.app to the Accessibility list above",
+            120.0,
+            82.0,
+            520.0,
+            24.0,
+            16.0,
+            true,
+        );
+        let fallback = make_label(
+            "If dragging is blocked, click + and choose /Applications/xhisperflow.app.",
+            120.0,
+            60.0,
+            560.0,
+            20.0,
+            13.0,
+            false,
+        );
+        let path_control = make_app_path_control(110.0, 18.0, 596.0, 34.0);
+
+        add_subviews(content, &[arrow, instruction, fallback, path_control]);
+        let _: () = msg_send![panel, center];
+        let frame: NSRect = msg_send![panel, frame];
+        let screen: id = msg_send![class!(NSScreen), mainScreen];
+        let visible_frame: NSRect = msg_send![screen, visibleFrame];
+        let x = visible_frame.origin.x + (visible_frame.size.width - frame.size.width) / 2.0;
+        let y = visible_frame.origin.y + 20.0;
+        let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(x, y)];
+        let _: () = msg_send![panel, makeKeyAndOrderFront: nil];
+    }
+}
+
+#[allow(deprecated)]
+fn make_app_path_control(x: f64, y: f64, width: f64, height: f64) -> id {
+    unsafe {
+        let path_control: id = msg_send![class!(NSPathControl), alloc];
+        let path_control: id = msg_send![
+            path_control,
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        let path = NSString::alloc(nil).init_str("/Applications/xhisperflow.app");
+        let url: id = msg_send![class!(NSURL), fileURLWithPath: path];
+        let _: () = msg_send![path_control, setURL: url];
+        let _: () = msg_send![path_control, setPathStyle: 1_i64];
+        let _: () = msg_send![path_control, setEditable: NO];
+        path_control
+    }
+}
+
+fn open_system_settings_privacy_pane(pane: &str) {
+    let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
+    let _ = std::process::Command::new("open").arg(url).status();
 }
 
 fn paste_text(config: &Config, text: &str) -> Result<()> {
