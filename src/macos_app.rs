@@ -999,35 +999,50 @@ fn show_accessibility_permission_prompt() {
         let _: () = msg_send![app, activateIgnoringOtherApps: YES];
 
         let window = make_setup_window(
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(720.0, 410.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 440.0)),
             "Enable xhisperflow",
         );
         let content: id = msg_send![window, contentView];
+        set_view_background(content, ns_color(0.13, 0.13, 0.15, 1.0), 0.0);
 
-        let icon = make_app_icon_view(316.0, 268.0, 88.0, 88.0);
-        let title = make_label("Enable xhisperflow", 0.0, 220.0, 720.0, 42.0, 30.0, true);
+        let icon = make_app_icon_view(248.0, 312.0, 64.0, 64.0);
+        let title = make_label("Enable xhisperflow", 0.0, 260.0, 560.0, 34.0, 23.0, true);
         let body = make_label(
             "xhisperflow needs these permissions to record and paste transcripts on your Mac.",
-            80.0,
-            178.0,
-            560.0,
-            46.0,
-            16.0,
+            78.0,
+            214.0,
+            404.0,
+            42.0,
+            13.5,
             false,
         );
-        let access_row = make_rounded_box(58.0, 90.0, 604.0, 82.0, 18.0);
-        let access_icon = make_accessibility_icon_label(80.0, 106.0);
-        let access_title = make_label("Accessibility", 156.0, 124.0, 260.0, 24.0, 18.0, true);
+        let _: () = msg_send![body, setAlignment: 1_i64];
+        let access_row = make_rounded_box(42.0, 118.0, 476.0, 74.0, 16.0);
+        let access_icon = make_permission_icon("accessibility", "A", 62.0, 130.0);
+        let access_title = make_label("Accessibility", 130.0, 151.0, 220.0, 22.0, 16.0, true);
         let access_detail = make_label(
             "Allows xhisperflow to paste into the active app",
-            156.0,
-            101.0,
-            350.0,
-            22.0,
-            14.0,
+            130.0,
+            130.0,
+            270.0,
+            20.0,
+            12.5,
             false,
         );
-        let allow = make_allow_button(572.0, 112.0, 74.0, 32.0);
+        let allow = make_allow_button(444.0, 141.0, 58.0, 28.0);
+        let mic_row = make_rounded_box(42.0, 34.0, 476.0, 74.0, 16.0);
+        let mic_icon = make_permission_icon("mic.fill", "M", 62.0, 46.0);
+        let mic_title = make_label("Microphone", 130.0, 67.0, 220.0, 22.0, 16.0, true);
+        let mic_detail = make_label(
+            "Records audio for transcription",
+            130.0,
+            46.0,
+            270.0,
+            20.0,
+            12.5,
+            false,
+        );
+        let mic_allow = make_microphone_button(444.0, 57.0, 58.0, 28.0);
 
         add_subviews(
             content,
@@ -1040,6 +1055,11 @@ fn show_accessibility_permission_prompt() {
                 access_title,
                 access_detail,
                 allow,
+                mic_row,
+                mic_icon,
+                mic_title,
+                mic_detail,
+                mic_allow,
             ],
         );
         let _: () = msg_send![window, center];
@@ -1085,31 +1105,44 @@ fn make_label(text: &str, x: f64, y: f64, width: f64, height: f64, size: f64, bo
             setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
         ];
         let _: () = msg_send![label, setFont: font];
-        let _: () = msg_send![label, setAlignment: if x == 0.0 { 2_i64 } else { 0_i64 }];
+        let _: () = msg_send![label, setAlignment: if x == 0.0 { 1_i64 } else { 0_i64 }];
         let _: () = msg_send![label, setLineBreakMode: 0_u64];
+        let _: () = msg_send![label, setTextColor: ns_color(0.90, 0.90, 0.92, 1.0)];
         label
     }
 }
 
 #[allow(deprecated)]
-fn make_accessibility_icon_label(x: f64, y: f64) -> id {
+fn make_permission_icon(symbol: &str, fallback: &str, x: f64, y: f64) -> id {
     unsafe {
         let view: id = msg_send![class!(NSView), alloc];
         let view: id = msg_send![
             view,
-            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(58.0, 58.0))
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(48.0, 48.0))
         ];
-        let _: () = msg_send![view, setWantsLayer: YES];
-        let layer: id = msg_send![view, layer];
         let color: id = msg_send![class!(NSColor), systemBlueColor];
-        let cg_color: *const c_void = msg_send![color, CGColor];
-        let _: () = msg_send![layer, setBackgroundColor: cg_color];
-        let _: () = msg_send![layer, setCornerRadius: 29.0_f64];
+        set_view_background(view, color, 24.0);
 
-        let glyph = make_label("A", 0.0, 12.0, 58.0, 34.0, 28.0, true);
+        let symbol_name = NSString::alloc(nil).init_str(symbol);
+        let image: id = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: symbol_name
+            accessibilityDescription: nil
+        ];
         let white: id = msg_send![class!(NSColor), whiteColor];
-        let _: () = msg_send![glyph, setTextColor: white];
-        let _: () = msg_send![view, addSubview: glyph];
+        if image != nil {
+            let image_view: id = msg_send![class!(NSImageView), imageViewWithImage: image];
+            let _: () = msg_send![
+                image_view,
+                setFrame: NSRect::new(NSPoint::new(9.0, 9.0), NSSize::new(30.0, 30.0))
+            ];
+            let _: () = msg_send![image_view, setContentTintColor: white];
+            let _: () = msg_send![view, addSubview: image_view];
+        } else {
+            let glyph = make_label(fallback, 0.0, 8.0, 48.0, 30.0, 24.0, true);
+            let _: () = msg_send![glyph, setTextColor: white];
+            let _: () = msg_send![view, addSubview: glyph];
+        }
         view
     }
 }
@@ -1132,6 +1165,30 @@ fn make_app_icon_view(x: f64, y: f64, width: f64, height: f64) -> id {
 }
 
 #[allow(deprecated)]
+fn set_view_background(view: id, color: id, radius: f64) {
+    unsafe {
+        let _: () = msg_send![view, setWantsLayer: YES];
+        let layer: id = msg_send![view, layer];
+        let cg_color: *const c_void = msg_send![color, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: cg_color];
+        let _: () = msg_send![layer, setCornerRadius: radius];
+    }
+}
+
+#[allow(deprecated)]
+fn ns_color(red: f64, green: f64, blue: f64, alpha: f64) -> id {
+    unsafe {
+        msg_send![
+            class!(NSColor),
+            colorWithCalibratedRed: red
+            green: green
+            blue: blue
+            alpha: alpha
+        ]
+    }
+}
+
+#[allow(deprecated)]
 fn make_rounded_box(x: f64, y: f64, width: f64, height: f64, radius: f64) -> id {
     unsafe {
         let view: id = msg_send![class!(NSView), alloc];
@@ -1139,12 +1196,7 @@ fn make_rounded_box(x: f64, y: f64, width: f64, height: f64, radius: f64) -> id 
             view,
             initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
         ];
-        let _: () = msg_send![view, setWantsLayer: YES];
-        let layer: id = msg_send![view, layer];
-        let color: id = msg_send![class!(NSColor), controlBackgroundColor];
-        let cg_color: *const c_void = msg_send![color, CGColor];
-        let _: () = msg_send![layer, setBackgroundColor: cg_color];
-        let _: () = msg_send![layer, setCornerRadius: radius];
+        set_view_background(view, ns_color(0.18, 0.18, 0.20, 1.0), radius);
         view
     }
 }
@@ -1166,6 +1218,25 @@ fn make_allow_button(x: f64, y: f64, width: f64, height: f64) -> id {
         ];
         let _: () = msg_send![button, setBezelStyle: 1_u64];
         let _: () = msg_send![button, setKeyEquivalent: key];
+        button
+    }
+}
+
+#[allow(deprecated)]
+fn make_microphone_button(x: f64, y: f64, width: f64, height: f64) -> id {
+    unsafe {
+        let title = NSString::alloc(nil).init_str("Allow");
+        let button: id = msg_send![
+            class!(NSButton),
+            buttonWithTitle: title
+            target: permission_setup_controller()
+            action: sel!(openMicrophoneFromPermissionWindow:)
+        ];
+        let _: () = msg_send![
+            button,
+            setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        let _: () = msg_send![button, setBezelStyle: 1_u64];
         button
     }
 }
@@ -1210,6 +1281,10 @@ fn permission_setup_controller_class() -> *const Class {
                     sel!(openAccessibilityFromPermissionWindow:),
                     open_accessibility_from_permission_window as extern "C" fn(&Object, Sel, id),
                 );
+                decl.add_method(
+                    sel!(openMicrophoneFromPermissionWindow:),
+                    open_microphone_from_permission_window as extern "C" fn(&Object, Sel, id),
+                );
                 CLASS = decl.register();
             }
         });
@@ -1226,38 +1301,43 @@ extern "C" fn open_accessibility_from_permission_window(_: &Object, _: Sel, send
     show_accessibility_drag_helper_panel();
 }
 
+extern "C" fn open_microphone_from_permission_window(_: &Object, _: Sel, _: id) {
+    open_system_settings_privacy_pane("Privacy_Microphone");
+}
+
 #[allow(deprecated)]
 fn show_accessibility_drag_helper_panel() {
     unsafe {
         let panel = make_setup_window(
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(740.0, 150.0)),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 128.0)),
             "Add xhisperflow to Accessibility",
         );
         let _: () = msg_send![panel, setLevel: 3_i64];
         let content: id = msg_send![panel, contentView];
+        set_view_background(content, ns_color(0.13, 0.13, 0.15, 0.96), 0.0);
 
-        let arrow = make_label("^", 44.0, 76.0, 64.0, 32.0, 24.0, true);
+        let arrow = make_arrow_icon(62.0, 66.0);
         let instruction = make_label(
             "Drag xhisperflow.app to the Accessibility list above",
-            120.0,
-            82.0,
-            520.0,
+            116.0,
+            72.0,
+            420.0,
             24.0,
-            16.0,
+            14.0,
             true,
         );
         let fallback = make_label(
             "If dragging is blocked, click + and choose /Applications/xhisperflow.app.",
-            120.0,
-            60.0,
-            560.0,
+            116.0,
+            52.0,
+            430.0,
             20.0,
-            13.0,
+            11.5,
             false,
         );
-        let path_control = make_app_path_control(110.0, 18.0, 596.0, 34.0);
+        let drag_tile = make_draggable_app_tile(88.0, 12.0, 444.0, 34.0);
 
-        add_subviews(content, &[arrow, instruction, fallback, path_control]);
+        add_subviews(content, &[arrow, instruction, fallback, drag_tile]);
         let _: () = msg_send![panel, center];
         let frame: NSRect = msg_send![panel, frame];
         let screen: id = msg_send![class!(NSScreen), mainScreen];
@@ -1270,19 +1350,84 @@ fn show_accessibility_drag_helper_panel() {
 }
 
 #[allow(deprecated)]
-fn make_app_path_control(x: f64, y: f64, width: f64, height: f64) -> id {
+fn make_arrow_icon(x: f64, y: f64) -> id {
     unsafe {
-        let path_control: id = msg_send![class!(NSPathControl), alloc];
-        let path_control: id = msg_send![
-            path_control,
+        let image: id = msg_send![
+            class!(NSImage),
+            imageWithSystemSymbolName: NSString::alloc(nil).init_str("arrow.up")
+            accessibilityDescription: nil
+        ];
+        if image != nil {
+            let image_view: id = msg_send![class!(NSImageView), imageViewWithImage: image];
+            let _: () = msg_send![
+                image_view,
+                setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(34.0, 34.0))
+            ];
+            let blue: id = msg_send![class!(NSColor), systemBlueColor];
+            let _: () = msg_send![image_view, setContentTintColor: blue];
+            image_view
+        } else {
+            let label = make_label("^", x, y, 34.0, 34.0, 26.0, true);
+            let blue: id = msg_send![class!(NSColor), systemBlueColor];
+            let _: () = msg_send![label, setTextColor: blue];
+            label
+        }
+    }
+}
+
+#[allow(deprecated)]
+fn make_draggable_app_tile(x: f64, y: f64, width: f64, height: f64) -> id {
+    unsafe {
+        let class = draggable_app_view_class();
+        let tile: id = msg_send![class, alloc];
+        let tile: id = msg_send![
+            tile,
             initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
         ];
+        set_view_background(tile, ns_color(0.16, 0.16, 0.18, 1.0), 6.0);
+
+        let icon = make_app_icon_view(10.0, 4.0, 26.0, 26.0);
+        let label = make_label("xhisperflow.app", 48.0, 7.0, width - 60.0, 20.0, 13.0, false);
+        add_subviews(tile, &[icon, label]);
+        tile
+    }
+}
+
+fn draggable_app_view_class() -> *const Class {
+    static INIT: Once = Once::new();
+    static mut CLASS: *const Class = std::ptr::null();
+
+    unsafe {
+        INIT.call_once(|| {
+            if let Some(existing) = Class::get("XhisperflowDraggableAppView") {
+                CLASS = existing;
+                return;
+            }
+
+            let superclass = class!(NSView);
+            if let Some(mut decl) = ClassDecl::new("XhisperflowDraggableAppView", superclass) {
+                decl.add_method(
+                    sel!(mouseDown:),
+                    drag_xhisperflow_app as extern "C" fn(&Object, Sel, id),
+                );
+                CLASS = decl.register();
+            }
+        });
+        CLASS
+    }
+}
+
+extern "C" fn drag_xhisperflow_app(view: &Object, _: Sel, event: id) {
+    unsafe {
         let path = NSString::alloc(nil).init_str("/Applications/xhisperflow.app");
-        let url: id = msg_send![class!(NSURL), fileURLWithPath: path];
-        let _: () = msg_send![path_control, setURL: url];
-        let _: () = msg_send![path_control, setPathStyle: 1_i64];
-        let _: () = msg_send![path_control, setEditable: NO];
-        path_control
+        let bounds: NSRect = msg_send![view, bounds];
+        let _: Boolean = msg_send![
+            view,
+            dragFile: path
+            fromRect: bounds
+            slideBack: YES
+            event: event
+        ];
     }
 }
 
