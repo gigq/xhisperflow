@@ -151,15 +151,17 @@ jobs:
       - name: Publish GitHub release assets
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
           TAG: ${{ github.ref_name }}
         run: |
           RELEASE_VERSION="${TAG#v}"
           ASSETS=(dist/*)
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" "${ASSETS[@]}" --clobber
+          if gh release view "$TAG" --repo "$GH_REPO" >/dev/null 2>&1; then
+            gh release upload "$TAG" "${ASSETS[@]}" --repo "$GH_REPO" --clobber
           else
             gh release create "$TAG" "${ASSETS[@]}" \
+              --repo "$GH_REPO" \
               --title "xhisperflow ${RELEASE_VERSION}" \
               --generate-notes
           fi
