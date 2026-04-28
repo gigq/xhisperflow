@@ -1,16 +1,31 @@
 # xhisperflow
 
-Pure Rust rewrite of `gigq/xhisper`.
+xhisperflow is a lightweight dictation app that records your voice, transcribes
+it with `whisper-large-v3-turbo` on Groq, optionally cleans up the text with
+`openai/gpt-oss-20b`, and inserts the final transcript into the app you were
+using.
 
-## What it keeps
+On macOS, xhisperflow runs as a menu bar app with a global hotkey, a small
+waveform HUD while recording, onboarding for required permissions, and direct
+paste into the active app. On Linux, it provides command-line tools that can be
+bound to your window manager or desktop shortcuts for push-to-toggle dictation.
 
-- Toggle recording by invoking `xhisperflow` twice
-- Groq Whisper transcription
-- Optional Groq post-processing cleanup
-- Wayland-first typing via `wtype`
-- Clipboard output mode
-- `xhisperflowtool` / `xhisperflowtoold` binaries for uinput paste, typing, and wrap keys
-- Live recording notification updates through `notify-send`
+![xhisperflow recording from the macOS menu bar](assets/docs/xhisperflow-in-use.png)
+
+## Features
+
+- Fast voice transcription using `whisper-large-v3-turbo`, with
+  `whisper-large-v3` used for long recordings.
+- Optional post-processing cleanup with `openai/gpt-oss-20b` for punctuation,
+  capitalization, and wording.
+- Global recording hotkeys
+- Menu bar controls for recording, canceling, permissions, API key setup, and
+  copying the last transcript.
+- Floating waveform HUD while recording.
+- Linux command-line workflow with notification updates through `notify-send`.
+- Wayland-first typing via `wtype`, with clipboard output mode available.
+- `xhisperflowtool` and `xhisperflowtoold` helpers for uinput paste, typing,
+  and wrap-key workflows.
 
 ## Build
 
@@ -47,7 +62,7 @@ The release workflow publishes a Linux tarball and a universal macOS DMG.
 ## macOS
 
 The macOS app is a native Rust menu bar app with a global recording hotkey,
-floating waveform HUD, Groq transcription, and paste into the active app.
+floating waveform HUD, Groq-hosted transcription, and paste into the active app.
 
 Build the app bundle:
 
