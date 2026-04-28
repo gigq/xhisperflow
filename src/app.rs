@@ -348,10 +348,14 @@ pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
         .multipart(form)
         .send()
         .context("transcription request failed")?;
+    let status = response.status();
 
     let body = response
         .text()
         .context("failed reading transcription response")?;
+    if !status.is_success() {
+        bail!("transcription request failed ({status}): {body}");
+    }
     let payload: Value = serde_json::from_str(&body).context("invalid transcription json")?;
     let mut transcription = payload["text"]
         .as_str()

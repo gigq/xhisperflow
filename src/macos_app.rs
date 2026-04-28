@@ -2,6 +2,7 @@ use crate::app::{LOG_PATH, load_home_env, log_timed_step, post_process, sleep_se
 use crate::config::{Config, config_file_path, home_dir};
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
+use block::ConcreteBlock;
 #[allow(deprecated)]
 use cocoa::appkit::{NSBackingStoreBuffered, NSColor, NSWindowStyleMask};
 #[allow(deprecated)]
@@ -29,14 +30,18 @@ use objc::{class, msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use softbuffer::Surface;
 use std::collections::VecDeque;
-use std::ffi::c_void;
-use std::fs::{self, File};
-use std::io::BufWriter;
+use std::env;
+use std::ffi::{CStr, c_void};
+use std::fs::{self, File, OpenOptions};
+use std::io::{BufWriter, Write};
 use std::num::NonZeroU32;
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{
+    Arc, Mutex, Once,
+    atomic::{AtomicBool, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant};
 use tray_icon::{
@@ -44,7 +49,7 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalPosition, PhysicalSize};
+use winit::dpi::{LogicalSize, PhysicalSize};
 use winit::event::WindowEvent;
 use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
@@ -58,6 +63,9 @@ type Boolean = u8;
 unsafe extern "C" {
     fn AXIsProcessTrusted() -> Boolean;
 }
+
+#[link(name = "AVFoundation", kind = "framework")]
+unsafe extern "C" {}
 
 const MAC_RECORDING_PATH: &str = "/tmp/xhisperflow-mac.wav";
 const HUD_WIDTH: u32 = 360;
@@ -108,6 +116,8 @@ enum UserEvent {
     OrderIndependentCancelHotKey,
     ModifierOnlyHotKey,
     ModifierOnlyCancelHotKey,
+    ModifierTapReady,
+    ModifierTapFailed(String),
     Worker(WorkerEvent),
 }
 
@@ -124,10 +134,15 @@ struct MacApp {
     toggle_item: Option<MenuItem>,
     status_item: Option<MenuItem>,
     cancel_item: Option<MenuItem>,
+    copy_last_item: Option<MenuItem>,
     login_item: Option<MenuItem>,
     hotkey: MacHotKey,
     cancel_hotkey: Option<MacHotKey>,
     hotkey_manager: GlobalHotKeyManager,
+    modifier_tap_hotkeys: ModifierTapHotKeys,
+    modifier_tap_started: bool,
+    modifier_tap_starting: bool,
+    last_permission_poll_at: Instant,
     window: Option<Rc<Window>>,
     window_id: Option<WindowId>,
     surface: Option<HudSurface>,
@@ -137,15 +152,19 @@ struct MacApp {
     status: String,
     started_at: Option<Instant>,
     last_hotkey_at: Option<Instant>,
+    last_transcription: Option<String>,
     accessibility_prompted: bool,
+    api_key_prompted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
 struct MenuIds {
     toggle: MenuId,
     cancel: MenuId,
+    copy_last: MenuId,
     login: Option<MenuId>,
     open_config: MenuId,
+    api_key_setup: MenuId,
     show_log: MenuId,
     permissions: MenuId,
     quit: MenuId,
@@ -214,10 +233,6 @@ impl MacApp {
             toggle_modifier_mods: hotkey.modifier_only_mods(),
             cancel_modifier_mods: cancel_hotkey.and_then(MacHotKey::modifier_only_mods),
         };
-        if tap_hotkeys.has_bindings() {
-            start_modifier_event_tap(proxy.clone(), tap_hotkeys);
-        }
-
         Ok(Self {
             proxy,
             config,
@@ -226,10 +241,15 @@ impl MacApp {
             toggle_item: None,
             status_item: None,
             cancel_item: None,
+            copy_last_item: None,
             login_item: None,
             hotkey,
             cancel_hotkey,
             hotkey_manager,
+            modifier_tap_hotkeys: tap_hotkeys,
+            modifier_tap_started: false,
+            modifier_tap_starting: false,
+            last_permission_poll_at: Instant::now(),
             window: None,
             window_id: None,
             surface: None,
@@ -239,7 +259,9 @@ impl MacApp {
             status: "Ready".to_string(),
             started_at: None,
             last_hotkey_at: None,
+            last_transcription: None,
             accessibility_prompted: false,
+            api_key_prompted: false,
         })
     }
 
@@ -247,8 +269,10 @@ impl MacApp {
         let menu = Menu::new();
         let toggle = MenuItem::new("Start Recording", true, None);
         let cancel = MenuItem::new("Cancel Recording", false, None);
+        let copy_last = MenuItem::new("Copy Last Transcription", false, None);
         let status = MenuItem::new("Ready", false, None);
         let open_config = MenuItem::new("Open Config", true, None);
+        let api_key_setup = MenuItem::new("API Key Setup", true, None);
         let show_log = MenuItem::new("Show Log", true, None);
         let login = (!login_agent_enabled()).then(|| MenuItem::new("Start at Login", true, None));
         let permissions = MenuItem::new("Permissions Help", true, None);
@@ -259,9 +283,11 @@ impl MacApp {
         menu.append_items(&[
             &toggle,
             &cancel,
+            &copy_last,
             &status,
             &separator,
             &open_config,
+            &api_key_setup,
             &show_log,
         ])
         .context("failed to build tray menu")?;
@@ -275,14 +301,17 @@ impl MacApp {
         self.menu_ids = MenuIds {
             toggle: toggle.id().clone(),
             cancel: cancel.id().clone(),
+            copy_last: copy_last.id().clone(),
             login: login.as_ref().map(|item| item.id().clone()),
             open_config: open_config.id().clone(),
+            api_key_setup: api_key_setup.id().clone(),
             show_log: show_log.id().clone(),
             permissions: permissions.id().clone(),
             quit: quit.id().clone(),
         };
         self.toggle_item = Some(toggle);
         self.cancel_item = Some(cancel);
+        self.copy_last_item = Some(copy_last);
         self.status_item = Some(status);
         self.login_item = login;
 
@@ -314,7 +343,7 @@ impl MacApp {
             .with_visible(false)
             .with_window_level(WindowLevel::AlwaysOnTop)
             .with_has_shadow(false)
-            .with_movable_by_window_background(true);
+            .with_movable_by_window_background(false);
 
         let window = Rc::new(
             event_loop
@@ -338,8 +367,12 @@ impl MacApp {
             self.toggle_recording();
         } else if id == &self.menu_ids.cancel {
             self.cancel_recording();
+        } else if id == &self.menu_ids.copy_last {
+            self.copy_last_transcription();
         } else if id == &self.menu_ids.open_config {
             self.open_config();
+        } else if id == &self.menu_ids.api_key_setup {
+            self.open_api_key_setup();
         } else if id == &self.menu_ids.show_log {
             self.open_path(Path::new(LOG_PATH));
         } else if self
@@ -391,6 +424,22 @@ impl MacApp {
     }
 
     fn start_recording(&mut self) {
+        if microphone_restart_required() {
+            self.set_status("Restart required");
+            show_microphone_restart_prompt();
+            return;
+        }
+        if !required_permissions_granted() {
+            self.set_status("Permissions required");
+            self.open_permissions_help();
+            return;
+        }
+        if !groq_api_key_present() {
+            self.set_status("Groq API key required");
+            self.open_api_key_setup();
+            return;
+        }
+
         self.clear_levels();
         match Recorder::start(PathBuf::from(MAC_RECORDING_PATH), self.levels.clone()) {
             Ok(recorder) => {
@@ -402,8 +451,15 @@ impl MacApp {
             }
             Err(err) => {
                 self.state = AppState::Idle;
-                self.set_status(&format!("Mic unavailable: {err:#}"));
-                self.show_hud(true);
+                if microphone_permission_granted() {
+                    MICROPHONE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
+                    self.set_status("Restart required");
+                    show_microphone_restart_prompt();
+                } else {
+                    self.set_status(&format!("Mic unavailable: {err:#}"));
+                    self.open_permissions_help();
+                    self.show_hud(true);
+                }
             }
         }
     }
@@ -471,6 +527,7 @@ impl MacApp {
                 self.show_hud(false);
             }
             Ok(text) => {
+                self.set_last_transcription(text.clone());
                 self.state = AppState::Pasting;
                 self.set_status("Pasting");
                 match paste_text(&self.config, &text) {
@@ -490,7 +547,32 @@ impl MacApp {
                 self.state = AppState::Idle;
                 self.set_status(&format!("Transcription failed: {err}"));
                 self.show_hud(true);
+                if !groq_api_key_present() || err.contains("GROQ_API_KEY") {
+                    self.open_api_key_setup();
+                }
             }
+        }
+    }
+
+    fn set_last_transcription(&mut self, text: String) {
+        self.last_transcription = Some(text);
+        if let Some(item) = &self.copy_last_item {
+            item.set_enabled(true);
+        }
+    }
+
+    fn copy_last_transcription(&mut self) {
+        let Some(text) = self.last_transcription.as_ref() else {
+            self.set_status("No transcription to copy");
+            return;
+        };
+
+        match Clipboard::new() {
+            Ok(mut clipboard) => match clipboard.set_text(text.clone()) {
+                Ok(()) => self.set_status("Copied last transcription"),
+                Err(err) => self.set_status(&format!("Copy failed: {err}")),
+            },
+            Err(err) => self.set_status(&format!("Copy failed: {err}")),
         }
     }
 
@@ -568,33 +650,74 @@ impl MacApp {
 
     fn maybe_prompt_for_accessibility_permission(&mut self) {
         let force_prompt = std::env::var_os("XHISPERFLOW_ACCESSIBILITY_PROMPT_PREVIEW").is_some();
-        if self.accessibility_prompted || (!force_prompt && accessibility_permission_granted()) {
+        if self.accessibility_prompted
+            || (!force_prompt && accessibility_permission_granted() && microphone_permission_granted())
+        {
             return;
         }
 
         self.accessibility_prompted = true;
-        self.set_status("Accessibility permission required");
+        self.set_status("Permissions required");
         if catch_unwind(AssertUnwindSafe(show_accessibility_permission_prompt)).is_err() {
             eprintln!("failed to show Accessibility permission prompt");
             open_system_settings_privacy_pane("Privacy_Accessibility");
         }
     }
 
+    fn maybe_prompt_for_api_key(&mut self) {
+        if self.api_key_prompted
+            || groq_api_key_present()
+            || !required_permissions_granted()
+            || permission_flow_needs_polling()
+            || microphone_restart_required()
+        {
+            return;
+        }
+
+        self.api_key_prompted = true;
+        self.set_status("Groq API key required");
+        self.open_api_key_setup();
+    }
+
+    fn ensure_modifier_event_tap_started(&mut self) {
+        if self.modifier_tap_started
+            || self.modifier_tap_starting
+            || !self.modifier_tap_hotkeys.has_bindings()
+            || !accessibility_permission_granted()
+        {
+            return;
+        }
+
+        append_log_line(&format!(
+            "starting macOS modifier hotkey listener: {:?}",
+            self.modifier_tap_hotkeys
+        ));
+        start_modifier_event_tap(self.proxy.clone(), self.modifier_tap_hotkeys);
+        self.modifier_tap_starting = true;
+    }
+
+    fn poll_permission_status(&mut self) {
+        if self.last_permission_poll_at.elapsed() < Duration::from_secs(1) {
+            return;
+        }
+        self.last_permission_poll_at = Instant::now();
+        if permission_flow_needs_polling() {
+            refresh_permission_buttons();
+        }
+        self.ensure_modifier_event_tap_started();
+        self.maybe_prompt_for_api_key();
+    }
+
     fn open_permissions_help(&self) {
-        self.open_microphone_settings();
-        self.open_accessibility_settings();
+        if catch_unwind(AssertUnwindSafe(show_accessibility_permission_prompt)).is_err() {
+            eprintln!("failed to show permissions help");
+        }
     }
 
-    fn open_accessibility_settings(&self) {
-        self.open_system_settings_privacy_pane("Privacy_Accessibility");
-    }
-
-    fn open_microphone_settings(&self) {
-        self.open_system_settings_privacy_pane("Privacy_Microphone");
-    }
-
-    fn open_system_settings_privacy_pane(&self, pane: &str) {
-        open_system_settings_privacy_pane(pane);
+    fn open_api_key_setup(&self) {
+        if catch_unwind(AssertUnwindSafe(show_api_key_setup_prompt)).is_err() {
+            eprintln!("failed to show API key setup");
+        }
     }
 
     fn toggle_start_at_login(&mut self) {
@@ -681,7 +804,9 @@ impl ApplicationHandler<UserEvent> for MacApp {
         if std::env::var_os("XHISPERFLOW_HUD_PREVIEW").is_some() {
             self.show_preview_hud();
         }
+        self.ensure_modifier_event_tap_started();
         self.maybe_prompt_for_accessibility_permission();
+        self.maybe_prompt_for_api_key();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -708,6 +833,17 @@ impl ApplicationHandler<UserEvent> for MacApp {
             UserEvent::OrderIndependentCancelHotKey => self.trigger_cancel_hotkey(),
             UserEvent::ModifierOnlyHotKey => self.trigger_hotkey_toggle(),
             UserEvent::ModifierOnlyCancelHotKey => self.trigger_cancel_hotkey(),
+            UserEvent::ModifierTapReady => {
+                self.modifier_tap_started = true;
+                self.modifier_tap_starting = false;
+                append_log_line("macOS modifier hotkey listener ready");
+            }
+            UserEvent::ModifierTapFailed(err) => {
+                self.modifier_tap_started = false;
+                self.modifier_tap_starting = false;
+                append_log_line(&format!("macOS modifier hotkey listener failed: {err}"));
+                self.set_status(&format!("Modifier hotkey unavailable: {err}"));
+            }
             UserEvent::Worker(WorkerEvent::TranscriptionFinished(result)) => {
                 self.finish_transcription(result);
             }
@@ -735,17 +871,29 @@ impl ApplicationHandler<UserEvent> for MacApp {
                     window.request_redraw();
                 }
             }
+            WindowEvent::Moved(_) => {
+                if matches!(self.state, AppState::Recording) {
+                    if let Some(window) = &self.window {
+                        position_hud_at_notch(window);
+                    }
+                }
+            }
             WindowEvent::CloseRequested => self.show_hud(false),
             _ => {}
         }
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        self.poll_permission_status();
         if matches!(self.state, AppState::Recording) {
             event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(33)));
             if let Some(window) = &self.window {
                 window.request_redraw();
             }
+        } else if permission_flow_needs_polling()
+            || (self.modifier_tap_hotkeys.has_bindings() && !self.modifier_tap_started)
+        {
+            event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_secs(1)));
         } else {
             event_loop.set_control_flow(ControlFlow::Wait);
         }
@@ -992,11 +1140,110 @@ fn accessibility_permission_granted() -> bool {
     unsafe { AXIsProcessTrusted() != 0 }
 }
 
+fn required_permissions_granted() -> bool {
+    accessibility_permission_granted() && microphone_permission_granted()
+}
+
+fn microphone_restart_required() -> bool {
+    MICROPHONE_RESTART_REQUIRED.load(Ordering::SeqCst)
+}
+
+fn microphone_permission_granted() -> bool {
+    microphone_authorization_status() == AV_AUTHORIZATION_STATUS_AUTHORIZED
+}
+
+fn microphone_authorization_status() -> i64 {
+    unsafe {
+        let Some(capture_device) = Class::get("AVCaptureDevice") else {
+            return -1;
+        };
+        let audio = NSString::alloc(nil).init_str("soun");
+        msg_send![capture_device, authorizationStatusForMediaType: audio]
+    }
+}
+
+fn request_microphone_permission() {
+    MICROPHONE_REQUEST_FINISHED.store(false, Ordering::SeqCst);
+    MICROPHONE_REQUEST_GRANTED.store(false, Ordering::SeqCst);
+
+    unsafe {
+        let Some(capture_device) = Class::get("AVCaptureDevice") else {
+            MICROPHONE_REQUEST_FINISHED.store(true, Ordering::SeqCst);
+            return;
+        };
+        let audio = NSString::alloc(nil).init_str("soun");
+        let completion = ConcreteBlock::new(|granted: Boolean| {
+            MICROPHONE_REQUEST_GRANTED.store(granted != 0, Ordering::SeqCst);
+            MICROPHONE_REQUEST_FINISHED.store(true, Ordering::SeqCst);
+        })
+        .copy();
+        let _: () = msg_send![
+            capture_device,
+            requestAccessForMediaType: audio
+            completionHandler: &*completion
+        ];
+        std::mem::forget(completion);
+    }
+}
+
+fn groq_api_key_present() -> bool {
+    env::var("GROQ_API_KEY")
+        .ok()
+        .is_some_and(|value| !value.trim().is_empty())
+}
+
+fn save_groq_api_key(api_key: &str) -> Result<()> {
+    let api_key = api_key.trim();
+    if api_key.is_empty() {
+        bail!("API key is empty");
+    }
+    if api_key.bytes().any(|byte| byte == b'\n' || byte == b'\r') {
+        bail!("API key must be a single line");
+    }
+
+    let path = home_dir().join(".env");
+    let existing = fs::read_to_string(&path).unwrap_or_default();
+    let mut lines = Vec::new();
+    let mut replaced = false;
+    for line in existing.lines() {
+        if line
+            .trim_start()
+            .strip_prefix("GROQ_API_KEY")
+            .is_some_and(|rest| rest.trim_start().starts_with('='))
+        {
+            lines.push(format!("GROQ_API_KEY={api_key}"));
+            replaced = true;
+        } else {
+            lines.push(line.to_string());
+        }
+    }
+    if !replaced {
+        if !lines.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
+            lines.push(String::new());
+        }
+        lines.push(format!("GROQ_API_KEY={api_key}"));
+    }
+
+    let mut contents = lines.join("\n");
+    contents.push('\n');
+    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
+    unsafe {
+        env::set_var("GROQ_API_KEY", api_key);
+    }
+    Ok(())
+}
+
 #[allow(deprecated)]
 fn show_accessibility_permission_prompt() {
     unsafe {
         let app: id = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+
+        if PERMISSION_SETUP_WINDOW != nil {
+            refresh_permission_buttons();
+            let _: () = msg_send![PERMISSION_SETUP_WINDOW, makeKeyAndOrderFront: nil];
+            return;
+        }
 
         let window = make_setup_window(
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(560.0, 440.0)),
@@ -1029,7 +1276,13 @@ fn show_accessibility_permission_prompt() {
             12.5,
             false,
         );
-        let allow = make_allow_button(444.0, 141.0, 58.0, 28.0);
+        let allow = make_permission_button(
+            428.0,
+            141.0,
+            74.0,
+            28.0,
+            sel!(openAccessibilityFromPermissionWindow:),
+        );
         let mic_row = make_rounded_box(42.0, 34.0, 476.0, 74.0, 16.0);
         let mic_icon = make_permission_icon("mic.fill", "M", 62.0, 46.0);
         let mic_title = make_label("Microphone", 130.0, 67.0, 220.0, 22.0, 16.0, true);
@@ -1042,7 +1295,16 @@ fn show_accessibility_permission_prompt() {
             12.5,
             false,
         );
-        let mic_allow = make_microphone_button(444.0, 57.0, 58.0, 28.0);
+        let mic_allow = make_permission_button(
+            428.0,
+            57.0,
+            74.0,
+            28.0,
+            sel!(openMicrophoneFromPermissionWindow:),
+        );
+        set_permission_buttons(allow, mic_allow);
+        refresh_permission_buttons();
+        start_permission_button_refresh_timer();
 
         add_subviews(
             content,
@@ -1063,7 +1325,64 @@ fn show_accessibility_permission_prompt() {
             ],
         );
         let _: () = msg_send![window, center];
+        let _: id = msg_send![window, retain];
+        PERMISSION_SETUP_WINDOW = window;
         let _: () = msg_send![window, makeKeyAndOrderFront: nil];
+    }
+}
+
+#[allow(deprecated)]
+fn show_api_key_setup_prompt() {
+    unsafe {
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+
+        if API_KEY_SETUP_WINDOW != nil {
+            let _: () = msg_send![API_KEY_SETUP_WINDOW, makeKeyAndOrderFront: nil];
+            return;
+        }
+
+        let window = make_setup_window(
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(740.0, 360.0)),
+            "Set Up xhisperflow",
+        );
+        let content: id = msg_send![window, contentView];
+        set_view_background(content, ns_color(0.13, 0.13, 0.15, 1.0), 0.0);
+
+        let icon = make_app_icon_view(338.0, 248.0, 64.0, 64.0);
+        let title = make_label("Add your Groq API key", 0.0, 205.0, 740.0, 34.0, 22.0, true);
+        let body = make_label(
+            "Paste your key below. xhisperflow saves it to ~/.env and uses it for transcription.",
+            132.0,
+            166.0,
+            476.0,
+            42.0,
+            13.0,
+            false,
+        );
+        let _: () = msg_send![body, setAlignment: 1_i64];
+
+        let input_box = make_rounded_box(62.0, 82.0, 616.0, 64.0, 14.0);
+        let input_label = make_label("GROQ_API_KEY", 82.0, 116.0, 180.0, 18.0, 11.0, true);
+        let field = make_secure_text_field(82.0, 91.0, 576.0, 24.0);
+        let status = make_label("", 82.0, 55.0, 400.0, 20.0, 11.5, false);
+        let save = make_controller_button(
+            "Save",
+            586.0,
+            50.0,
+            92.0,
+            30.0,
+            sel!(saveApiKeyFromSetupWindow:),
+        );
+
+        API_KEY_FIELD = field;
+        API_KEY_STATUS_LABEL = status;
+        add_subviews(content, &[icon, title, body, input_box, input_label, field, status, save]);
+        let _: () = msg_send![window, center];
+        let _: id = msg_send![window, retain];
+        API_KEY_SETUP_WINDOW = window;
+        let _: () = msg_send![window, makeKeyAndOrderFront: nil];
+        let _: () = msg_send![window, makeFirstResponder: field];
     }
 }
 
@@ -1202,7 +1521,7 @@ fn make_rounded_box(x: f64, y: f64, width: f64, height: f64, radius: f64) -> id 
 }
 
 #[allow(deprecated)]
-fn make_allow_button(x: f64, y: f64, width: f64, height: f64) -> id {
+fn make_permission_button(x: f64, y: f64, width: f64, height: f64, action: Sel) -> id {
     unsafe {
         let title = NSString::alloc(nil).init_str("Allow");
         let key = NSString::alloc(nil).init_str("\r");
@@ -1210,7 +1529,7 @@ fn make_allow_button(x: f64, y: f64, width: f64, height: f64) -> id {
             class!(NSButton),
             buttonWithTitle: title
             target: permission_setup_controller()
-            action: sel!(openAccessibilityFromPermissionWindow:)
+            action: action
         ];
         let _: () = msg_send![
             button,
@@ -1223,23 +1542,111 @@ fn make_allow_button(x: f64, y: f64, width: f64, height: f64) -> id {
 }
 
 #[allow(deprecated)]
-fn make_microphone_button(x: f64, y: f64, width: f64, height: f64) -> id {
+fn make_controller_button(title: &str, x: f64, y: f64, width: f64, height: f64, action: Sel) -> id {
     unsafe {
-        let title = NSString::alloc(nil).init_str("Allow");
+        let title = NSString::alloc(nil).init_str(title);
+        let key = NSString::alloc(nil).init_str("\r");
         let button: id = msg_send![
             class!(NSButton),
             buttonWithTitle: title
             target: permission_setup_controller()
-            action: sel!(openMicrophoneFromPermissionWindow:)
+            action: action
         ];
         let _: () = msg_send![
             button,
             setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
         ];
         let _: () = msg_send![button, setBezelStyle: 1_u64];
+        let _: () = msg_send![button, setKeyEquivalent: key];
         button
     }
 }
+
+#[allow(deprecated)]
+fn make_secure_text_field(x: f64, y: f64, width: f64, height: f64) -> id {
+    unsafe {
+        let field: id = msg_send![class!(NSSecureTextField), alloc];
+        let field: id = msg_send![
+            field,
+            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
+        ];
+        let placeholder = NSString::alloc(nil).init_str("gsk_...");
+        let font: id = msg_send![class!(NSFont), systemFontOfSize: 13.0_f64];
+        let _: () = msg_send![field, setPlaceholderString: placeholder];
+        let _: () = msg_send![field, setFont: font];
+        let _: () = msg_send![field, setBezeled: YES];
+        let _: () = msg_send![field, setEditable: YES];
+        let _: () = msg_send![field, setSelectable: YES];
+        field
+    }
+}
+
+#[allow(deprecated)]
+fn set_permission_buttons(accessibility_button: id, microphone_button: id) {
+    unsafe {
+        ACCESSIBILITY_PERMISSION_BUTTON = accessibility_button;
+        MICROPHONE_PERMISSION_BUTTON = microphone_button;
+    }
+}
+
+#[allow(deprecated)]
+fn refresh_permission_buttons() {
+    unsafe {
+        let accessibility_allowed = accessibility_permission_granted();
+        let microphone_allowed = microphone_permission_granted();
+        update_permission_button(ACCESSIBILITY_PERMISSION_BUTTON, accessibility_allowed);
+        update_permission_button(MICROPHONE_PERMISSION_BUTTON, microphone_allowed);
+        update_permission_flow(accessibility_allowed, microphone_allowed);
+    }
+}
+
+#[allow(deprecated)]
+fn update_permission_button(button: id, allowed: bool) {
+    unsafe {
+        if button == nil {
+            return;
+        }
+        let title = if allowed { "Allowed" } else { "Allow" };
+        let title = NSString::alloc(nil).init_str(title);
+        let _: () = msg_send![button, setTitle: title];
+        let _: () = msg_send![button, setEnabled: if allowed { NO } else { YES }];
+    }
+}
+
+#[allow(deprecated)]
+fn start_permission_button_refresh_timer() {
+    static INIT: Once = Once::new();
+
+    unsafe {
+        INIT.call_once(|| {
+            let _: id = msg_send![
+                class!(NSTimer),
+                scheduledTimerWithTimeInterval: 1.0_f64
+                target: permission_setup_controller()
+                selector: sel!(refreshPermissionButtons:)
+                userInfo: nil
+                repeats: YES
+            ];
+        });
+    }
+}
+
+static mut ACCESSIBILITY_PERMISSION_BUTTON: id = nil;
+static mut MICROPHONE_PERMISSION_BUTTON: id = nil;
+static mut PERMISSION_SETUP_WINDOW: id = nil;
+static mut PERMISSION_HELPER_PANEL: id = nil;
+static mut ACTIVE_PERMISSION_HELPER: i32 = PERMISSION_NONE;
+static mut API_KEY_SETUP_WINDOW: id = nil;
+static mut API_KEY_FIELD: id = nil;
+static mut API_KEY_STATUS_LABEL: id = nil;
+static MICROPHONE_REQUEST_FINISHED: AtomicBool = AtomicBool::new(false);
+static MICROPHONE_REQUEST_GRANTED: AtomicBool = AtomicBool::new(false);
+static MICROPHONE_RESTART_REQUIRED: AtomicBool = AtomicBool::new(false);
+const PERMISSION_NONE: i32 = 0;
+const PERMISSION_ACCESSIBILITY: i32 = 1;
+const PERMISSION_MICROPHONE: i32 = 2;
+const AV_AUTHORIZATION_STATUS_NOT_DETERMINED: i64 = 0;
+const AV_AUTHORIZATION_STATUS_AUTHORIZED: i64 = 3;
 
 fn add_subviews(content: id, views: &[id]) {
     unsafe {
@@ -1285,6 +1692,18 @@ fn permission_setup_controller_class() -> *const Class {
                     sel!(openMicrophoneFromPermissionWindow:),
                     open_microphone_from_permission_window as extern "C" fn(&Object, Sel, id),
                 );
+                decl.add_method(
+                    sel!(refreshPermissionButtons:),
+                    refresh_permission_buttons_from_timer as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(saveApiKeyFromSetupWindow:),
+                    save_api_key_from_setup_window as extern "C" fn(&Object, Sel, id),
+                );
+                decl.add_method(
+                    sel!(restartXhisperflow:),
+                    restart_xhisperflow_from_helper as extern "C" fn(&Object, Sel, id),
+                );
                 CLASS = decl.register();
             }
         });
@@ -1293,32 +1712,317 @@ fn permission_setup_controller_class() -> *const Class {
 }
 
 extern "C" fn open_accessibility_from_permission_window(_: &Object, _: Sel, sender: id) {
-    unsafe {
-        let window: id = msg_send![sender, window];
-        let _: () = msg_send![window, orderOut: nil];
-    }
+    hide_permission_setup_window(sender);
     open_system_settings_privacy_pane("Privacy_Accessibility");
-    show_accessibility_drag_helper_panel();
+    set_active_permission_helper(PERMISSION_ACCESSIBILITY);
+    show_permission_drag_helper_panel("Accessibility", "Drag xhisperflow.app to the Accessibility list above");
+    refresh_permission_buttons();
 }
 
-extern "C" fn open_microphone_from_permission_window(_: &Object, _: Sel, _: id) {
-    open_system_settings_privacy_pane("Privacy_Microphone");
+extern "C" fn open_microphone_from_permission_window(_: &Object, _: Sel, sender: id) {
+    hide_permission_setup_window(sender);
+    set_active_permission_helper(PERMISSION_MICROPHONE);
+    if microphone_authorization_status() == AV_AUTHORIZATION_STATUS_NOT_DETERMINED {
+        show_microphone_prompt_helper_panel();
+        request_microphone_permission();
+    } else {
+        open_system_settings_privacy_pane("Privacy_Microphone");
+        show_microphone_settings_helper_panel();
+    }
+    refresh_permission_buttons();
+}
+
+extern "C" fn refresh_permission_buttons_from_timer(_: &Object, _: Sel, _: id) {
+    refresh_permission_buttons();
+}
+
+extern "C" fn save_api_key_from_setup_window(_: &Object, _: Sel, _: id) {
+    unsafe {
+        if API_KEY_FIELD == nil {
+            return;
+        }
+
+        let value: id = msg_send![API_KEY_FIELD, stringValue];
+        match save_groq_api_key(&nsstring_to_string(value)) {
+            Ok(()) => {
+                if API_KEY_SETUP_WINDOW != nil {
+                    let _: () = msg_send![API_KEY_SETUP_WINDOW, close];
+                    API_KEY_SETUP_WINDOW = nil;
+                }
+                API_KEY_FIELD = nil;
+                API_KEY_STATUS_LABEL = nil;
+            }
+            Err(err) => set_api_key_status(&format!("{err:#}")),
+        }
+    }
+}
+
+extern "C" fn restart_xhisperflow_from_helper(_: &Object, _: Sel, _: id) {
+    unsafe {
+        MICROPHONE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
+        relaunch_current_app();
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, terminate: nil];
+    }
+}
+
+fn nsstring_to_string(value: id) -> String {
+    unsafe {
+        if value == nil {
+            return String::new();
+        }
+        let bytes: *const std::os::raw::c_char = msg_send![value, UTF8String];
+        if bytes.is_null() {
+            return String::new();
+        }
+        CStr::from_ptr(bytes).to_string_lossy().into_owned()
+    }
 }
 
 #[allow(deprecated)]
-fn show_accessibility_drag_helper_panel() {
+fn set_api_key_status(message: &str) {
     unsafe {
+        if API_KEY_STATUS_LABEL == nil {
+            return;
+        }
+        let message = NSString::alloc(nil).init_str(message);
+        let _: () = msg_send![API_KEY_STATUS_LABEL, setStringValue: message];
+        let red: id = msg_send![class!(NSColor), systemRedColor];
+        let _: () = msg_send![API_KEY_STATUS_LABEL, setTextColor: red];
+    }
+}
+
+#[allow(deprecated)]
+fn hide_permission_setup_window(sender: id) {
+    unsafe {
+        let window: id = msg_send![sender, window];
+        if window != nil {
+            PERMISSION_SETUP_WINDOW = window;
+            let _: () = msg_send![window, orderOut: nil];
+        }
+    }
+}
+
+fn set_active_permission_helper(permission: i32) {
+    unsafe {
+        ACTIVE_PERMISSION_HELPER = permission;
+    }
+}
+
+fn permission_flow_needs_polling() -> bool {
+    unsafe { ACTIVE_PERMISSION_HELPER != PERMISSION_NONE || PERMISSION_SETUP_WINDOW != nil }
+}
+
+#[allow(deprecated)]
+fn update_permission_flow(accessibility_allowed: bool, microphone_allowed: bool) {
+    unsafe {
+        if ACTIVE_PERMISSION_HELPER == PERMISSION_MICROPHONE
+            && MICROPHONE_REQUEST_FINISHED.swap(false, Ordering::SeqCst)
+        {
+            if MICROPHONE_REQUEST_GRANTED.load(Ordering::SeqCst) {
+                ACTIVE_PERMISSION_HELPER = PERMISSION_NONE;
+                close_permission_helper_panel();
+                close_system_settings_window();
+                close_permission_setup_window();
+                MICROPHONE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
+                show_microphone_restart_prompt();
+            } else {
+                open_system_settings_privacy_pane("Privacy_Microphone");
+                show_microphone_settings_helper_panel();
+            }
+            return;
+        }
+
+        let active_permission_allowed =
+            (ACTIVE_PERMISSION_HELPER == PERMISSION_ACCESSIBILITY && accessibility_allowed)
+                || (ACTIVE_PERMISSION_HELPER == PERMISSION_MICROPHONE && microphone_allowed);
+
+        if active_permission_allowed {
+            let microphone_was_allowed =
+                ACTIVE_PERMISSION_HELPER == PERMISSION_MICROPHONE && microphone_allowed;
+            ACTIVE_PERMISSION_HELPER = PERMISSION_NONE;
+            close_permission_helper_panel();
+            close_system_settings_window();
+            if accessibility_allowed && microphone_allowed {
+                close_permission_setup_window();
+                if microphone_was_allowed {
+                    MICROPHONE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
+                    show_microphone_restart_prompt();
+                }
+            } else {
+                show_permission_setup_window();
+            }
+        }
+    }
+}
+
+#[allow(deprecated)]
+fn close_permission_helper_panel() {
+    unsafe {
+        if PERMISSION_HELPER_PANEL != nil {
+            let _: () = msg_send![PERMISSION_HELPER_PANEL, close];
+            PERMISSION_HELPER_PANEL = nil;
+        }
+    }
+}
+
+#[allow(deprecated)]
+fn show_permission_setup_window() {
+    unsafe {
+        if PERMISSION_SETUP_WINDOW == nil {
+            return;
+        }
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+        let _: () = msg_send![PERMISSION_SETUP_WINDOW, orderFrontRegardless];
+    }
+}
+
+#[allow(deprecated)]
+fn close_permission_setup_window() {
+    unsafe {
+        if PERMISSION_SETUP_WINDOW != nil {
+            let _: () = msg_send![PERMISSION_SETUP_WINDOW, close];
+            PERMISSION_SETUP_WINDOW = nil;
+        }
+    }
+}
+
+fn wait_for_system_settings_window() {
+    for _ in 0..10 {
+        if system_settings_window_frame().is_some() {
+            return;
+        }
+        thread::sleep(Duration::from_millis(120));
+    }
+}
+
+fn system_settings_window_frame() -> Option<(f64, f64, f64, f64)> {
+    let output = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to tell process \"System Settings\" to get {position, size} of window 1",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8(output.stdout).ok()?;
+    let mut values = stdout
+        .split(',')
+        .filter_map(|value| value.trim().parse::<f64>().ok());
+    Some((values.next()?, values.next()?, values.next()?, values.next()?))
+}
+
+fn close_system_settings_window() {
+    let _ = std::process::Command::new("osascript")
+        .args([
+            "-e",
+            "tell application \"System Events\" to set settings_running to exists process \"System Settings\"",
+            "-e",
+            "if settings_running then tell application \"System Settings\" to if (count of windows) > 0 then close window 1",
+        ])
+        .status();
+}
+
+#[allow(deprecated)]
+fn show_microphone_restart_prompt() {
+    unsafe {
+        let app: id = msg_send![class!(NSApplication), sharedApplication];
+        let _: () = msg_send![app, activateIgnoringOtherApps: YES];
+
+        let alert: id = msg_send![class!(NSAlert), alloc];
+        let alert: id = msg_send![alert, init];
+        let title = NSString::alloc(nil).init_str("Restart xhisperflow");
+        let detail = NSString::alloc(nil).init_str(
+            "Microphone access is enabled. Restart xhisperflow now so recording can use the new permission.",
+        );
+        let restart = NSString::alloc(nil).init_str("Restart Now");
+        let later = NSString::alloc(nil).init_str("Later");
+        let _: () = msg_send![alert, setMessageText: title];
+        let _: () = msg_send![alert, setInformativeText: detail];
+        let _: id = msg_send![alert, addButtonWithTitle: restart];
+        let _: id = msg_send![alert, addButtonWithTitle: later];
+        let response: i64 = msg_send![alert, runModal];
+        let _: () = msg_send![alert, release];
+
+        if response == 1000 {
+            relaunch_current_app();
+            let _: () = msg_send![app, terminate: nil];
+        }
+    }
+}
+
+fn relaunch_current_app() {
+    let Ok(exe) = env::current_exe() else {
+        return;
+    };
+    if let Some(app_bundle) = exe.ancestors().find(|path| {
+        path.extension()
+            .and_then(|extension| extension.to_str())
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("app"))
+    }) {
+        let _ = std::process::Command::new("open")
+            .arg("-n")
+            .arg(app_bundle)
+            .status();
+        return;
+    }
+
+    let _ = std::process::Command::new(exe).spawn();
+}
+
+#[allow(deprecated)]
+fn position_permission_helper_panel(panel: id) {
+    unsafe {
+        let frame: NSRect = msg_send![panel, frame];
+        let screen: id = msg_send![class!(NSScreen), mainScreen];
+        let screen_frame: NSRect = msg_send![screen, frame];
+        let visible_frame: NSRect = msg_send![screen, visibleFrame];
+
+        if let Some((settings_x, settings_y, settings_width, settings_height)) =
+            system_settings_window_frame()
+        {
+            let x = settings_x + (settings_width - frame.size.width) / 2.0;
+            let y = screen_frame.size.height - settings_y - settings_height + 12.0;
+            let x = x.clamp(
+                visible_frame.origin.x,
+                visible_frame.origin.x + visible_frame.size.width - frame.size.width,
+            );
+            let y = y.clamp(
+                visible_frame.origin.y,
+                visible_frame.origin.y + visible_frame.size.height - frame.size.height,
+            );
+            let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(x, y)];
+            return;
+        }
+
+        let x = visible_frame.origin.x + (visible_frame.size.width - frame.size.width) / 2.0;
+        let y = visible_frame.origin.y + 20.0;
+        let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(x, y)];
+    }
+}
+
+#[allow(deprecated)]
+fn show_permission_drag_helper_panel(permission: &str, instruction: &str) {
+    unsafe {
+        wait_for_system_settings_window();
+        close_permission_helper_panel();
+
+        let title = format!("Add xhisperflow to {permission}");
         let panel = make_setup_window(
             NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 128.0)),
-            "Add xhisperflow to Accessibility",
+            &title,
         );
-        let _: () = msg_send![panel, setLevel: 3_i64];
+        let _: () = msg_send![panel, setMovableByWindowBackground: NO];
+        let _: () = msg_send![panel, setLevel: 25_i64];
         let content: id = msg_send![panel, contentView];
         set_view_background(content, ns_color(0.13, 0.13, 0.15, 0.96), 0.0);
 
         let arrow = make_arrow_icon(62.0, 66.0);
         let instruction = make_label(
-            "Drag xhisperflow.app to the Accessibility list above",
+            instruction,
             116.0,
             72.0,
             420.0,
@@ -1338,14 +2042,106 @@ fn show_accessibility_drag_helper_panel() {
         let drag_tile = make_draggable_app_tile(88.0, 12.0, 444.0, 34.0);
 
         add_subviews(content, &[arrow, instruction, fallback, drag_tile]);
-        let _: () = msg_send![panel, center];
-        let frame: NSRect = msg_send![panel, frame];
-        let screen: id = msg_send![class!(NSScreen), mainScreen];
-        let visible_frame: NSRect = msg_send![screen, visibleFrame];
-        let x = visible_frame.origin.x + (visible_frame.size.width - frame.size.width) / 2.0;
-        let y = visible_frame.origin.y + 20.0;
-        let _: () = msg_send![panel, setFrameOrigin: NSPoint::new(x, y)];
-        let _: () = msg_send![panel, makeKeyAndOrderFront: nil];
+        position_permission_helper_panel(panel);
+        let _: id = msg_send![panel, retain];
+        PERMISSION_HELPER_PANEL = panel;
+        let _: () = msg_send![panel, orderFrontRegardless];
+    }
+}
+
+#[allow(deprecated)]
+fn show_microphone_prompt_helper_panel() {
+    show_permission_instruction_helper_panel(
+        "Allow Microphone Access",
+        "Use the macOS prompt to allow microphone access",
+        "If you choose Don't Allow, you can turn it on in System Settings.",
+        false,
+    );
+}
+
+#[allow(deprecated)]
+fn show_microphone_settings_helper_panel() {
+    wait_for_system_settings_window();
+    unsafe {
+        close_permission_helper_panel();
+
+        let panel = make_setup_window(
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 134.0)),
+            "Enable Microphone Access",
+        );
+        let _: () = msg_send![panel, setMovableByWindowBackground: NO];
+        let _: () = msg_send![panel, setLevel: 25_i64];
+        let content: id = msg_send![panel, contentView];
+        set_view_background(content, ns_color(0.13, 0.13, 0.15, 0.96), 0.0);
+
+        let arrow = make_arrow_icon(62.0, 64.0);
+        let instruction = make_label(
+            "Turn on xhisperflow in the Microphone list above",
+            116.0,
+            80.0,
+            430.0,
+            24.0,
+            14.0,
+            true,
+        );
+        let detail = make_label(
+            "After enabling it, restart xhisperflow so recording can use the new permission.",
+            116.0,
+            58.0,
+            430.0,
+            20.0,
+            11.5,
+            false,
+        );
+        let restart = make_controller_button(
+            "Restart xhisperflow",
+            233.0,
+            18.0,
+            154.0,
+            30.0,
+            sel!(restartXhisperflow:),
+        );
+
+        add_subviews(content, &[arrow, instruction, detail, restart]);
+        position_permission_helper_panel(panel);
+        let _: id = msg_send![panel, retain];
+        PERMISSION_HELPER_PANEL = panel;
+        let _: () = msg_send![panel, orderFrontRegardless];
+    }
+}
+
+#[allow(deprecated)]
+fn show_permission_instruction_helper_panel(
+    title: &str,
+    instruction: &str,
+    detail: &str,
+    align_to_settings: bool,
+) {
+    unsafe {
+        close_permission_helper_panel();
+
+        let panel = make_setup_window(
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(620.0, 112.0)),
+            title,
+        );
+        let _: () = msg_send![panel, setMovableByWindowBackground: NO];
+        let _: () = msg_send![panel, setLevel: 25_i64];
+        let content: id = msg_send![panel, contentView];
+        set_view_background(content, ns_color(0.13, 0.13, 0.15, 0.96), 0.0);
+
+        let arrow = make_arrow_icon(62.0, 42.0);
+        let instruction = make_label(instruction, 116.0, 58.0, 430.0, 24.0, 14.0, true);
+        let detail = make_label(detail, 116.0, 36.0, 430.0, 20.0, 11.5, false);
+
+        add_subviews(content, &[arrow, instruction, detail]);
+        if align_to_settings {
+            position_permission_helper_panel(panel);
+        } else {
+            let _: () = msg_send![panel, center];
+        }
+        let _: id = msg_send![panel, retain];
+        PERMISSION_HELPER_PANEL = panel;
+        let _: () = msg_send![panel, orderFrontRegardless];
     }
 }
 
@@ -1407,6 +2203,14 @@ fn draggable_app_view_class() -> *const Class {
             let superclass = class!(NSView);
             if let Some(mut decl) = ClassDecl::new("XhisperflowDraggableAppView", superclass) {
                 decl.add_method(
+                    sel!(hitTest:),
+                    draggable_app_hit_test as extern "C" fn(&Object, Sel, NSPoint) -> id,
+                );
+                decl.add_method(
+                    sel!(acceptsFirstMouse:),
+                    draggable_app_accepts_first_mouse as extern "C" fn(&Object, Sel, id) -> Boolean,
+                );
+                decl.add_method(
                     sel!(mouseDown:),
                     drag_xhisperflow_app as extern "C" fn(&Object, Sel, id),
                 );
@@ -1415,6 +2219,21 @@ fn draggable_app_view_class() -> *const Class {
         });
         CLASS
     }
+}
+
+extern "C" fn draggable_app_hit_test(view: &Object, _: Sel, point: NSPoint) -> id {
+    unsafe {
+        let bounds: NSRect = msg_send![view, bounds];
+        let inside = point.x >= bounds.origin.x
+            && point.x <= bounds.origin.x + bounds.size.width
+            && point.y >= bounds.origin.y
+            && point.y <= bounds.origin.y + bounds.size.height;
+        if inside { view as *const Object as id } else { nil }
+    }
+}
+
+extern "C" fn draggable_app_accepts_first_mouse(_: &Object, _: Sel, _: id) -> Boolean {
+    1
 }
 
 extern "C" fn drag_xhisperflow_app(view: &Object, _: Sel, event: id) {
@@ -1434,6 +2253,12 @@ extern "C" fn drag_xhisperflow_app(view: &Object, _: Sel, event: id) {
 fn open_system_settings_privacy_pane(pane: &str) {
     let url = format!("x-apple.systempreferences:com.apple.preference.security?{pane}");
     let _ = std::process::Command::new("open").arg(url).status();
+}
+
+fn append_log_line(message: &str) {
+    if let Ok(mut file) = OpenOptions::new().create(true).append(true).open(LOG_PATH) {
+        let _ = writeln!(file, "{message}");
+    }
 }
 
 fn paste_text(config: &Config, text: &str) -> Result<()> {
@@ -1692,10 +2517,11 @@ fn start_modifier_event_tap(proxy: EventLoopProxy<UserEvent>, hotkeys: ModifierT
     thread::spawn(move || {
         let state = Arc::new(Mutex::new(ModifierTapState::default()));
         let tap_state = state.clone();
+        let callback_proxy = proxy.clone();
         let event_tap = CGEventTap::new(
             CGEventTapLocation::Session,
             CGEventTapPlacement::HeadInsertEventTap,
-            CGEventTapOptions::ListenOnly,
+            CGEventTapOptions::Default,
             vec![
                 CGEventType::KeyDown,
                 CGEventType::KeyUp,
@@ -1706,7 +2532,7 @@ fn start_modifier_event_tap(proxy: EventLoopProxy<UserEvent>, hotkeys: ModifierT
                     proxy_ref,
                     event_type,
                     event,
-                    &proxy,
+                    &callback_proxy,
                     &tap_state,
                     hotkeys,
                 )
@@ -1714,21 +2540,34 @@ fn start_modifier_event_tap(proxy: EventLoopProxy<UserEvent>, hotkeys: ModifierT
         );
 
         let Ok(event_tap) = event_tap else {
-            eprintln!(
-                "failed to install Escape hotkey key-order listener; falling back to standard hotkey handling"
-            );
+            append_log_line("macOS modifier hotkey listener could not install event tap");
+            let _ = proxy.send_event(UserEvent::ModifierTapFailed(
+                "could not install macOS event tap".to_string(),
+            ));
             return;
         };
 
-        let loop_source = event_tap
-            .mach_port()
-            .create_runloop_source(0)
-            .expect("failed to create Escape hotkey event tap run loop source");
+        let loop_source = match event_tap.mach_port().create_runloop_source(0) {
+            Ok(loop_source) => loop_source,
+            Err(_) => {
+                append_log_line("macOS modifier hotkey listener could not attach run loop source");
+                let _ = proxy.send_event(UserEvent::ModifierTapFailed(
+                    "could not attach event tap to run loop".to_string(),
+                ));
+                return;
+            }
+        };
         CFRunLoop::get_current().add_source(&loop_source, unsafe {
             core_foundation::runloop::kCFRunLoopCommonModes
         });
         event_tap.enable();
+        append_log_line("macOS modifier hotkey listener installed");
+        let _ = proxy.send_event(UserEvent::ModifierTapReady);
         CFRunLoop::run_current();
+        append_log_line("macOS modifier hotkey listener run loop stopped");
+        let _ = proxy.send_event(UserEvent::ModifierTapFailed(
+            "macOS event tap stopped".to_string(),
+        ));
     });
 }
 
@@ -1795,8 +2634,10 @@ fn send_modifier_only_event(
     state.last_modifier_mods = (!mods.is_empty()).then_some(mods);
 
     if Some(mods) == hotkeys.cancel_modifier_mods {
+        append_log_line(&format!("matched modifier-only cancel hotkey: {mods:?}"));
         let _ = proxy.send_event(UserEvent::ModifierOnlyCancelHotKey);
     } else if Some(mods) == hotkeys.toggle_modifier_mods {
+        append_log_line(&format!("matched modifier-only toggle hotkey: {mods:?}"));
         let _ = proxy.send_event(UserEvent::ModifierOnlyHotKey);
     }
 }
@@ -1913,21 +2754,69 @@ fn draw_waveform_bar(
 }
 
 fn position_hud_at_notch(window: &Window) {
-    let Some(monitor) = window
-        .current_monitor()
-        .or_else(|| window.primary_monitor())
-        .or_else(|| window.available_monitors().next())
-    else {
+    let Ok(handle) = window.window_handle() else {
         return;
     };
 
-    let monitor_position = monitor.position();
-    let monitor_size = monitor.size();
-    let window_size = window.outer_size();
-    let x =
-        monitor_position.x + ((monitor_size.width as i32 - window_size.width as i32) / 2).max(0);
-    let y = monitor_position.y + HUD_TOP_OFFSET;
-    window.set_outer_position(PhysicalPosition::new(x, y));
+    let RawWindowHandle::AppKit(handle) = handle.as_raw() else {
+        return;
+    };
+
+    unsafe {
+        let Some(screen) = screen_containing_mouse() else {
+            return;
+        };
+        let view = handle.ns_view.as_ptr() as id;
+        let ns_window: id = msg_send![view, window];
+        if ns_window == nil {
+            return;
+        }
+
+        let screen_frame: NSRect = msg_send![screen, frame];
+        let window_frame: NSRect = msg_send![ns_window, frame];
+        let window_width = if window_frame.size.width > 0.0 {
+            window_frame.size.width
+        } else {
+            f64::from(HUD_WIDTH)
+        };
+        let x = screen_frame.origin.x + ((screen_frame.size.width - window_width) / 2.0).max(0.0);
+        let y = screen_frame.origin.y + screen_frame.size.height - f64::from(HUD_TOP_OFFSET);
+        let _: () = msg_send![ns_window, setFrameTopLeftPoint: NSPoint::new(x, y)];
+    }
+}
+
+#[allow(deprecated, unexpected_cfgs)]
+unsafe fn screen_containing_mouse() -> Option<id> {
+    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    let screens: id = msg_send![class!(NSScreen), screens];
+    if screens != nil {
+        let count: usize = msg_send![screens, count];
+        for idx in 0..count {
+            let screen: id = msg_send![screens, objectAtIndex: idx];
+            if screen == nil {
+                continue;
+            }
+            let frame: NSRect = msg_send![screen, frame];
+            if point_in_rect(mouse, frame) {
+                return Some(screen);
+            }
+        }
+    }
+
+    let main_screen: id = msg_send![class!(NSScreen), mainScreen];
+    if main_screen == nil {
+        None
+    } else {
+        Some(main_screen)
+    }
+}
+
+#[allow(deprecated)]
+fn point_in_rect(point: NSPoint, rect: NSRect) -> bool {
+    point.x >= rect.origin.x
+        && point.x <= rect.origin.x + rect.size.width
+        && point.y >= rect.origin.y
+        && point.y <= rect.origin.y + rect.size.height
 }
 
 #[allow(deprecated, unexpected_cfgs)]
