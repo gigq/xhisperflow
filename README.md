@@ -62,6 +62,9 @@ The app uses `Option+Space` by default. Configure it in:
 ~/Library/Application Support/xhisperflow/xhisperflowrc
 ```
 
+macOS hotkeys can be standard key chords like `option+space` or modifier-only
+chords like `ctrl+opt`.
+
 Use `cancel-hotkey` to bind a shortcut that discards the current recording
 without transcription. Set it to an empty string to disable the cancel shortcut.
 

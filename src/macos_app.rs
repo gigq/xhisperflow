@@ -96,6 +96,8 @@ enum UserEvent {
     HotKey(GlobalHotKeyEvent),
     OrderIndependentHotKey,
     OrderIndependentCancelHotKey,
+    ModifierOnlyHotKey,
+    ModifierOnlyCancelHotKey,
     Worker(WorkerEvent),
 }
 
@@ -113,8 +115,8 @@ struct MacApp {
     status_item: Option<MenuItem>,
     cancel_item: Option<MenuItem>,
     login_item: Option<MenuItem>,
-    hotkey: HotKey,
-    cancel_hotkey: Option<HotKey>,
+    hotkey: MacHotKey,
+    cancel_hotkey: Option<MacHotKey>,
     hotkey_manager: GlobalHotKeyManager,
     window: Option<Rc<Window>>,
     window_id: Option<WindowId>,
@@ -146,28 +148,63 @@ enum AppState {
     Pasting,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum MacHotKey {
+    Standard(HotKey),
+    ModifierOnly(Modifiers),
+}
+
+impl MacHotKey {
+    fn standard_hotkey(self) -> Option<HotKey> {
+        match self {
+            Self::Standard(hotkey) => Some(hotkey),
+            Self::ModifierOnly(_) => None,
+        }
+    }
+
+    fn escape_mods(self) -> Option<Modifiers> {
+        match self {
+            Self::Standard(hotkey) => order_independent_escape_mods(hotkey),
+            Self::ModifierOnly(_) => None,
+        }
+    }
+
+    fn modifier_only_mods(self) -> Option<Modifiers> {
+        match self {
+            Self::Standard(_) => None,
+            Self::ModifierOnly(mods) => Some(mods),
+        }
+    }
+}
+
 impl MacApp {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
         let config = Config::load();
-        let hotkey = parse_hotkey(&config.mac_hotkey)?;
+        let hotkey = parse_hotkey_binding(&config.mac_hotkey)?;
         let hotkey_manager =
             GlobalHotKeyManager::new().context("failed to create global hotkey manager")?;
-        hotkey_manager
-            .register(hotkey)
-            .with_context(|| format!("failed to register hotkey '{}'", config.mac_hotkey))?;
-        let cancel_hotkey = parse_optional_hotkey(&config.mac_cancel_hotkey)?;
-        if let Some(cancel_hotkey) = cancel_hotkey {
-            hotkey_manager.register(cancel_hotkey).with_context(|| {
+        if let Some(standard_hotkey) = hotkey.standard_hotkey() {
+            hotkey_manager
+                .register(standard_hotkey)
+                .with_context(|| format!("failed to register hotkey '{}'", config.mac_hotkey))?;
+        }
+        let cancel_hotkey = parse_optional_hotkey_binding(&config.mac_cancel_hotkey)?;
+        if let Some(standard_cancel_hotkey) = cancel_hotkey.and_then(MacHotKey::standard_hotkey) {
+            hotkey_manager.register(standard_cancel_hotkey).with_context(|| {
                 format!(
                     "failed to register cancel hotkey '{}'",
                     config.mac_cancel_hotkey
                 )
             })?;
         }
-        let toggle_escape_mods = order_independent_escape_mods(hotkey);
-        let cancel_escape_mods = cancel_hotkey.and_then(order_independent_escape_mods);
-        if toggle_escape_mods.is_some() || cancel_escape_mods.is_some() {
-            start_escape_modifier_event_tap(proxy.clone(), toggle_escape_mods, cancel_escape_mods);
+        let tap_hotkeys = ModifierTapHotKeys {
+            toggle_escape_mods: hotkey.escape_mods(),
+            cancel_escape_mods: cancel_hotkey.and_then(MacHotKey::escape_mods),
+            toggle_modifier_mods: hotkey.modifier_only_mods(),
+            cancel_modifier_mods: cancel_hotkey.and_then(MacHotKey::modifier_only_mods),
+        };
+        if tap_hotkeys.has_bindings() {
+            start_modifier_event_tap(proxy.clone(), tap_hotkeys);
         }
 
         Ok(Self {
@@ -616,10 +653,16 @@ impl ApplicationHandler<UserEvent> for MacApp {
         match event {
             UserEvent::Menu(event) => self.handle_menu(event_loop, event),
             UserEvent::HotKey(event) => {
-                if event.id == self.hotkey.id() && matches!(event.state, HotKeyState::Pressed) {
+                if self
+                    .hotkey
+                    .standard_hotkey()
+                    .is_some_and(|hotkey| event.id == hotkey.id())
+                    && matches!(event.state, HotKeyState::Pressed)
+                {
                     self.trigger_hotkey_toggle();
                 } else if self
                     .cancel_hotkey
+                    .and_then(MacHotKey::standard_hotkey)
                     .is_some_and(|hotkey| event.id == hotkey.id())
                     && matches!(event.state, HotKeyState::Pressed)
                 {
@@ -628,6 +671,8 @@ impl ApplicationHandler<UserEvent> for MacApp {
             }
             UserEvent::OrderIndependentHotKey => self.trigger_hotkey_toggle(),
             UserEvent::OrderIndependentCancelHotKey => self.trigger_cancel_hotkey(),
+            UserEvent::ModifierOnlyHotKey => self.trigger_hotkey_toggle(),
+            UserEvent::ModifierOnlyCancelHotKey => self.trigger_cancel_hotkey(),
             UserEvent::Worker(WorkerEvent::TranscriptionFinished(result)) => {
                 self.finish_transcription(result);
             }
@@ -672,8 +717,10 @@ impl ApplicationHandler<UserEvent> for MacApp {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
-        let _ = self.hotkey_manager.unregister(self.hotkey);
-        if let Some(cancel_hotkey) = self.cancel_hotkey {
+        if let Some(hotkey) = self.hotkey.standard_hotkey() {
+            let _ = self.hotkey_manager.unregister(hotkey);
+        }
+        if let Some(cancel_hotkey) = self.cancel_hotkey.and_then(MacHotKey::standard_hotkey) {
             let _ = self.hotkey_manager.unregister(cancel_hotkey);
         }
         if let Some(recorder) = self.recorder.take() {
@@ -1039,17 +1086,21 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn parse_hotkey(value: &str) -> Result<HotKey> {
+fn parse_hotkey_binding(value: &str) -> Result<MacHotKey> {
+    parse_standard_hotkey(value)
+        .map(MacHotKey::Standard)
+        .or_else(|standard_err| {
+            parse_modifier_only_hotkey(value)
+                .map(MacHotKey::ModifierOnly)
+                .ok_or(standard_err)
+        })
+        .with_context(|| format!("invalid hotkey '{value}'"))
+}
+
+fn parse_standard_hotkey(value: &str) -> Result<HotKey> {
     let normalized = value
         .split('+')
-        .map(|part| match part.trim().to_ascii_lowercase().as_str() {
-            "option" | "opt" | "alt" => "alt".to_string(),
-            "cmd" | "command" | "meta" | "super" => "super".to_string(),
-            "ctrl" | "control" => "ctrl".to_string(),
-            "shift" => "shift".to_string(),
-            "space" => "space".to_string(),
-            other => other.to_string(),
-        })
+        .map(normalize_hotkey_token)
         .collect::<Vec<_>>()
         .join("+");
 
@@ -1062,14 +1113,69 @@ fn parse_hotkey(value: &str) -> Result<HotKey> {
                 normalized.parse::<HotKey>()
             }
         })
-        .with_context(|| format!("invalid hotkey '{value}'"))
+        .with_context(|| format!("invalid standard hotkey '{value}'"))
 }
 
-fn parse_optional_hotkey(value: &str) -> Result<Option<HotKey>> {
+fn parse_modifier_only_hotkey(value: &str) -> Option<Modifiers> {
+    let mut mods = Modifiers::empty();
+    let mut found_modifier = false;
+
+    for token in value.split('+').map(normalize_hotkey_token) {
+        let modifier = match token.as_str() {
+            "alt" => Modifiers::ALT,
+            "ctrl" => Modifiers::CONTROL,
+            "shift" => Modifiers::SHIFT,
+            "super" => Modifiers::SUPER,
+            _ => return None,
+        };
+        mods |= modifier;
+        found_modifier = true;
+    }
+
+    found_modifier.then_some(mods)
+}
+
+fn normalize_hotkey_token(part: &str) -> String {
+    match part.trim().to_ascii_lowercase().as_str() {
+        "option" | "opt" | "alt" => "alt".to_string(),
+        "cmd" | "command" | "meta" | "super" => "super".to_string(),
+        "ctrl" | "control" => "ctrl".to_string(),
+        "shift" => "shift".to_string(),
+        "space" => "space".to_string(),
+        other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_standard_hotkey_binding() {
+        assert!(matches!(
+            parse_hotkey_binding("ctrl+opt+space").unwrap(),
+            MacHotKey::Standard(_)
+        ));
+    }
+
+    #[test]
+    fn parses_modifier_only_hotkey_binding() {
+        assert_eq!(
+            parse_hotkey_binding("ctrl+opt").unwrap(),
+            MacHotKey::ModifierOnly(Modifiers::CONTROL | Modifiers::ALT)
+        );
+        assert_eq!(
+            parse_hotkey_binding("ctrl+shift").unwrap(),
+            MacHotKey::ModifierOnly(Modifiers::CONTROL | Modifiers::SHIFT)
+        );
+    }
+}
+
+fn parse_optional_hotkey_binding(value: &str) -> Result<Option<MacHotKey>> {
     if value.trim().is_empty() {
         return Ok(None);
     }
-    parse_hotkey(value).map(Some)
+    parse_hotkey_binding(value).map(Some)
 }
 
 fn order_independent_escape_mods(hotkey: HotKey) -> Option<Modifiers> {
@@ -1077,17 +1183,31 @@ fn order_independent_escape_mods(hotkey: HotKey) -> Option<Modifiers> {
 }
 
 #[derive(Default)]
-struct EscapeModifierTapState {
+struct ModifierTapState {
     escape_down: bool,
+    last_modifier_mods: Option<Modifiers>,
 }
 
-fn start_escape_modifier_event_tap(
-    proxy: EventLoopProxy<UserEvent>,
-    toggle_mods: Option<Modifiers>,
-    cancel_mods: Option<Modifiers>,
-) {
+#[derive(Clone, Copy, Debug, Default)]
+struct ModifierTapHotKeys {
+    toggle_escape_mods: Option<Modifiers>,
+    cancel_escape_mods: Option<Modifiers>,
+    toggle_modifier_mods: Option<Modifiers>,
+    cancel_modifier_mods: Option<Modifiers>,
+}
+
+impl ModifierTapHotKeys {
+    fn has_bindings(self) -> bool {
+        self.toggle_escape_mods.is_some()
+            || self.cancel_escape_mods.is_some()
+            || self.toggle_modifier_mods.is_some()
+            || self.cancel_modifier_mods.is_some()
+    }
+}
+
+fn start_modifier_event_tap(proxy: EventLoopProxy<UserEvent>, hotkeys: ModifierTapHotKeys) {
     thread::spawn(move || {
-        let state = Arc::new(Mutex::new(EscapeModifierTapState::default()));
+        let state = Arc::new(Mutex::new(ModifierTapState::default()));
         let tap_state = state.clone();
         let event_tap = CGEventTap::new(
             CGEventTapLocation::Session,
@@ -1105,8 +1225,7 @@ fn start_escape_modifier_event_tap(
                     event,
                     &proxy,
                     &tap_state,
-                    toggle_mods,
-                    cancel_mods,
+                    hotkeys,
                 )
             },
         );
@@ -1135,9 +1254,8 @@ fn handle_escape_modifier_tap_event(
     event_type: CGEventType,
     event: &CGEvent,
     proxy: &EventLoopProxy<UserEvent>,
-    state: &Arc<Mutex<EscapeModifierTapState>>,
-    toggle_mods: Option<Modifiers>,
-    cancel_mods: Option<Modifiers>,
+    state: &Arc<Mutex<ModifierTapState>>,
+    hotkeys: ModifierTapHotKeys,
 ) -> CallbackResult {
     let keycode = event.get_integer_value_field(EventField::KEYBOARD_EVENT_KEYCODE) as u16;
     let mods = modifiers_from_event_flags(event.get_flags());
@@ -1148,7 +1266,7 @@ fn handle_escape_modifier_tap_event(
                 if let Ok(mut state) = state.lock() {
                     state.escape_down = true;
                 }
-                send_escape_modifier_event(proxy, mods, toggle_mods, cancel_mods);
+                send_escape_modifier_event(proxy, mods, hotkeys);
             }
         }
         CGEventType::KeyUp if keycode == KeyCode::ESCAPE => {
@@ -1156,9 +1274,12 @@ fn handle_escape_modifier_tap_event(
                 state.escape_down = false;
             }
         }
-        CGEventType::FlagsChanged if !mods.is_empty() => {
-            if state.lock().is_ok_and(|state| state.escape_down) {
-                send_escape_modifier_event(proxy, mods, toggle_mods, cancel_mods);
+        CGEventType::FlagsChanged => {
+            if let Ok(mut state) = state.lock() {
+                if state.escape_down && !mods.is_empty() {
+                    send_escape_modifier_event(proxy, mods, hotkeys);
+                }
+                send_modifier_only_event(proxy, mods, hotkeys, &mut state);
             }
         }
         _ => {}
@@ -1170,13 +1291,30 @@ fn handle_escape_modifier_tap_event(
 fn send_escape_modifier_event(
     proxy: &EventLoopProxy<UserEvent>,
     mods: Modifiers,
-    toggle_mods: Option<Modifiers>,
-    cancel_mods: Option<Modifiers>,
+    hotkeys: ModifierTapHotKeys,
 ) {
-    if Some(mods) == cancel_mods {
+    if Some(mods) == hotkeys.cancel_escape_mods {
         let _ = proxy.send_event(UserEvent::OrderIndependentCancelHotKey);
-    } else if Some(mods) == toggle_mods {
+    } else if Some(mods) == hotkeys.toggle_escape_mods {
         let _ = proxy.send_event(UserEvent::OrderIndependentHotKey);
+    }
+}
+
+fn send_modifier_only_event(
+    proxy: &EventLoopProxy<UserEvent>,
+    mods: Modifiers,
+    hotkeys: ModifierTapHotKeys,
+    state: &mut ModifierTapState,
+) {
+    if state.last_modifier_mods == Some(mods) {
+        return;
+    }
+    state.last_modifier_mods = (!mods.is_empty()).then_some(mods);
+
+    if Some(mods) == hotkeys.cancel_modifier_mods {
+        let _ = proxy.send_event(UserEvent::ModifierOnlyCancelHotKey);
+    } else if Some(mods) == hotkeys.toggle_modifier_mods {
+        let _ = proxy.send_event(UserEvent::ModifierOnlyHotKey);
     }
 }
 
