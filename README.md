@@ -5,10 +5,11 @@ it with `whisper-large-v3-turbo` on Groq, optionally cleans up the text with
 `openai/gpt-oss-20b`, and inserts the final transcript into the app you were
 using.
 
-On macOS, xhisperflow runs as a menu bar app with a global hotkey, a small
-waveform HUD while recording, onboarding for required permissions, and direct
-paste into the active app. On Linux, it provides command-line tools that can be
-bound to your window manager or desktop shortcuts for push-to-toggle dictation.
+On macOS, xhisperflow runs as a menu bar app with a global hotkey, onboarding
+for required permissions, and direct paste into the active app. On Linux, it
+provides command-line tools that can be bound to your window manager or desktop
+shortcuts for push-to-toggle dictation. Both platforms display the same floating
+waveform HUD while recording.
 
 ![xhisperflow recording from the macOS menu bar](assets/docs/xhisperflow-in-use.png)
 
@@ -22,7 +23,9 @@ bound to your window manager or desktop shortcuts for push-to-toggle dictation.
 - Menu bar controls for recording, canceling, permissions, API key setup, and
   copying the last transcript.
 - Floating waveform HUD while recording.
-- Linux command-line workflow with notification updates through `notify-send`.
+- Native Wayland and X11 waveform HUDs on Linux, with notification updates as a
+  fallback.
+- `--cancel` support for discarding a Linux recording without transcription.
 - Wayland-first typing via `wtype`, with clipboard output mode available.
 - `xhisperflowtool` and `xhisperflowtoold` helpers for uinput paste, typing,
   and wrap-key workflows.
@@ -78,14 +81,15 @@ The app uses `Option+Space` by default. Configure it in:
 ```
 
 macOS hotkeys can be standard key chords like `option+space` or modifier-only
-chords like `ctrl+opt`.
+chords like `ctrl+shift`. The default cancel hotkey is `Control+Shift`.
 
 Use `cancel-hotkey` to bind a shortcut that discards the current recording
 without transcription. Set it to an empty string to disable the cancel shortcut.
 
-The floating HUD can be disabled with `mac-floating-waveform : false`. Its
-waveform colors are configured with `mac-waveform-gradient-start` and
-`mac-waveform-gradient-end` using quoted `#RRGGBB` values.
+The floating HUD can be disabled with `floating-waveform : false`. Its colors
+are configured with `waveform-gradient-start` and `waveform-gradient-end` using
+quoted `#RRGGBB` values. The previous `mac-*` names remain accepted for existing
+configurations.
 
 Use the menu bar app's Start at Login item to install a per-user LaunchAgent
 for the current app.
@@ -113,3 +117,19 @@ Copy [default_xhisperflowrc](./default_xhisperflowrc) to:
 ```
 
 `GROQ_API_KEY` is read from the environment or `~/.env`.
+
+On Linux, bind `xhisperflow` to start or finish dictation and bind
+`xhisperflow --cancel` to discard the current recording without transcription.
+Global shortcuts are configured by the desktop environment or compositor.
+
+### Linux waveform HUD
+
+On Wayland, xhisperflow uses the `wlr-layer-shell` protocol to place the HUD at
+the top center of the current display. Compositors without that protocol fall
+back to X11 through XWayland when `DISPLAY` is available. Native X11 sessions
+use an always-on-top notification window. If neither window backend can start,
+the existing `notify-send` level meter is used automatically.
+
+While recording, the waveform responds to the microphone level. During
+transcription, the same HUD switches to a repeating left-to-right ripple so the
+processing state is visually distinct from listening on both Linux and macOS.

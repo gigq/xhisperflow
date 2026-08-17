@@ -1,5 +1,9 @@
 use crate::app::{LOG_PATH, load_home_env, log_timed_step, post_process, sleep_secs, transcribe};
 use crate::config::{Config, config_file_path, home_dir};
+use crate::waveform::{
+    HUD_HEIGHT, HUD_WIDTH, LEVEL_HISTORY, SharedLevels, WaveformColor, WaveformMode, WaveformStyle,
+    draw_waveform, parse_hex_color, push_level, shared_levels, snapshot,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
 use block::ConcreteBlock;
@@ -29,7 +33,6 @@ use objc::runtime::{Class, Object, Sel};
 use objc::{class, msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use softbuffer::Surface;
-use std::collections::VecDeque;
 use std::env;
 use std::ffi::{CStr, c_void};
 use std::fs::{self, File, OpenOptions};
@@ -49,7 +52,7 @@ use tray_icon::{
     menu::{Menu, MenuEvent, MenuId, MenuItem, PredefinedMenuItem},
 };
 use winit::application::ApplicationHandler;
-use winit::dpi::{LogicalSize, PhysicalSize};
+use winit::dpi::LogicalSize;
 use winit::event::WindowEvent;
 use winit::event_loop::{
     ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy, OwnedDisplayHandle,
@@ -68,18 +71,11 @@ unsafe extern "C" {
 unsafe extern "C" {}
 
 const MAC_RECORDING_PATH: &str = "/tmp/xhisperflow-mac.wav";
-const HUD_WIDTH: u32 = 360;
-const HUD_HEIGHT: u32 = 78;
 const HUD_TOP_OFFSET: i32 = 0;
 const HUD_BOTTOM_RADIUS: f64 = 18.0;
 const HUD_SHOULDER_Y: f64 = 14.0;
 const HUD_SHOULDER_INSET: f64 = 8.0;
-const WAVEFORM_HEIGHT: u32 = 58;
-const WAVEFORM_BOTTOM_PADDING: u32 = 14;
-const WAVEFORM_LEVEL_FLOOR: f32 = 0.10;
-const WAVEFORM_LEVEL_CEILING: f32 = 0.62;
 const HOTKEY_DEBOUNCE: Duration = Duration::from_millis(250);
-const LEVEL_HISTORY: usize = 180;
 const LOGIN_AGENT_LABEL: &str = "com.gigq.xhisperflow";
 
 type HudSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
@@ -146,7 +142,7 @@ struct MacApp {
     window: Option<Rc<Window>>,
     window_id: Option<WindowId>,
     surface: Option<HudSurface>,
-    levels: Arc<Mutex<VecDeque<f32>>>,
+    levels: SharedLevels,
     recorder: Option<Recorder>,
     state: AppState,
     status: String,
@@ -220,12 +216,14 @@ impl MacApp {
         }
         let cancel_hotkey = parse_optional_hotkey_binding(&config.mac_cancel_hotkey)?;
         if let Some(standard_cancel_hotkey) = cancel_hotkey.and_then(MacHotKey::standard_hotkey) {
-            hotkey_manager.register(standard_cancel_hotkey).with_context(|| {
-                format!(
-                    "failed to register cancel hotkey '{}'",
-                    config.mac_cancel_hotkey
-                )
-            })?;
+            hotkey_manager
+                .register(standard_cancel_hotkey)
+                .with_context(|| {
+                    format!(
+                        "failed to register cancel hotkey '{}'",
+                        config.mac_cancel_hotkey
+                    )
+                })?;
         }
         let tap_hotkeys = ModifierTapHotKeys {
             toggle_escape_mods: hotkey.escape_mods(),
@@ -253,7 +251,7 @@ impl MacApp {
             window: None,
             window_id: None,
             surface: None,
-            levels: Arc::new(Mutex::new(VecDeque::with_capacity(LEVEL_HISTORY))),
+            levels: shared_levels(),
             recorder: None,
             state: AppState::Idle,
             status: "Ready".to_string(),
@@ -472,6 +470,7 @@ impl MacApp {
         };
 
         self.state = AppState::Transcribing;
+        self.started_at = Some(Instant::now());
         self.set_status("Transcribing");
 
         match recorder.stop() {
@@ -496,6 +495,7 @@ impl MacApp {
             }
             Err(err) => {
                 self.state = AppState::Idle;
+                self.started_at = None;
                 self.set_status(&format!("Recording failed: {err:#}"));
             }
         }
@@ -520,6 +520,7 @@ impl MacApp {
     }
 
     fn finish_transcription(&mut self, result: Result<String, String>) {
+        self.started_at = None;
         match result {
             Ok(text) if text.trim().is_empty() => {
                 self.state = AppState::Idle;
@@ -607,6 +608,14 @@ impl MacApp {
     }
 
     fn show_preview_hud(&mut self) {
+        if std::env::var("XHISPERFLOW_HUD_PREVIEW").is_ok_and(|value| value == "processing") {
+            self.clear_levels();
+            self.state = AppState::Transcribing;
+            self.started_at = Some(Instant::now());
+            self.show_hud(true);
+            return;
+        }
+
         if let Ok(mut levels) = self.levels.lock() {
             levels.clear();
             for idx in 0..LEVEL_HISTORY {
@@ -616,6 +625,7 @@ impl MacApp {
             }
         }
         self.state = AppState::Recording;
+        self.started_at = Some(Instant::now());
         self.show_hud(true);
     }
 
@@ -624,7 +634,7 @@ impl MacApp {
             if visible {
                 position_hud_at_notch(window);
             }
-            window.set_visible(visible && self.config.mac_floating_waveform);
+            window.set_visible(visible && self.config.floating_waveform);
             if visible {
                 window.request_redraw();
             }
@@ -651,7 +661,9 @@ impl MacApp {
     fn maybe_prompt_for_accessibility_permission(&mut self) {
         let force_prompt = std::env::var_os("XHISPERFLOW_ACCESSIBILITY_PROMPT_PREVIEW").is_some();
         if self.accessibility_prompted
-            || (!force_prompt && accessibility_permission_granted() && microphone_permission_granted())
+            || (!force_prompt
+                && accessibility_permission_granted()
+                && microphone_permission_granted())
         {
             return;
         }
@@ -757,29 +769,43 @@ impl MacApp {
             .resize(width, height)
             .map_err(|err| anyhow!("failed to resize waveform surface: {err:?}"))?;
 
-        let levels = self
-            .levels
-            .lock()
-            .map(|levels| levels.iter().copied().collect::<Vec<_>>())
-            .unwrap_or_default();
+        let levels = snapshot(&self.levels);
         let mut buffer = surface
             .buffer_mut()
             .map_err(|err| anyhow!("failed to acquire waveform buffer: {err:?}"))?;
         let gradient_start = parse_hex_color(
-            &self.config.mac_waveform_gradient_start,
-            HudColor::new(181, 140, 255),
+            &self.config.waveform_gradient_start,
+            WaveformColor::new(181, 140, 255),
         );
         let gradient_end = parse_hex_color(
-            &self.config.mac_waveform_gradient_end,
-            HudColor::new(215, 230, 255),
+            &self.config.waveform_gradient_end,
+            WaveformColor::new(215, 230, 255),
         );
         draw_waveform(
             &mut buffer,
-            size,
+            size.width,
+            size.height,
             &levels,
-            self.state,
-            gradient_start,
-            gradient_end,
+            match self.state {
+                AppState::Recording => 1.8,
+                AppState::Transcribing => 0.9,
+                AppState::Pasting => 0.55,
+                AppState::Idle => 0.35,
+            },
+            match self.state {
+                AppState::Transcribing => WaveformMode::Processing {
+                    elapsed_seconds: self
+                        .started_at
+                        .map(|started| started.elapsed().as_secs_f32())
+                        .unwrap_or_default(),
+                },
+                _ => WaveformMode::Listening,
+            },
+            WaveformStyle {
+                gradient_start,
+                gradient_end,
+                rounded_background: false,
+            },
         );
         buffer
             .present()
@@ -885,7 +911,7 @@ impl ApplicationHandler<UserEvent> for MacApp {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         self.poll_permission_status();
-        if matches!(self.state, AppState::Recording) {
+        if matches!(self.state, AppState::Recording | AppState::Transcribing) {
             event_loop.set_control_flow(ControlFlow::wait_duration(Duration::from_millis(33)));
             if let Some(window) = &self.window {
                 window.request_redraw();
@@ -919,7 +945,7 @@ struct Recorder {
 }
 
 impl Recorder {
-    fn start(output_path: PathBuf, levels: Arc<Mutex<VecDeque<f32>>>) -> Result<Self> {
+    fn start(output_path: PathBuf, levels: SharedLevels) -> Result<Self> {
         let host = cpal::default_host();
         let device = host
             .default_input_device()
@@ -1020,7 +1046,7 @@ fn write_f32_input(
     data: &[f32],
     channels: usize,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    levels: &Arc<Mutex<VecDeque<f32>>>,
+    levels: &SharedLevels,
 ) {
     write_input(
         data.chunks(channels)
@@ -1034,7 +1060,7 @@ fn write_f64_input(
     data: &[f64],
     channels: usize,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    levels: &Arc<Mutex<VecDeque<f32>>>,
+    levels: &SharedLevels,
 ) {
     write_input(
         data.chunks(channels)
@@ -1048,7 +1074,7 @@ fn write_i16_input(
     data: &[i16],
     channels: usize,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    levels: &Arc<Mutex<VecDeque<f32>>>,
+    levels: &SharedLevels,
 ) {
     write_input(
         data.chunks(channels).map(|frame| {
@@ -1067,7 +1093,7 @@ fn write_i32_input(
     data: &[i32],
     channels: usize,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    levels: &Arc<Mutex<VecDeque<f32>>>,
+    levels: &SharedLevels,
 ) {
     write_input(
         data.chunks(channels).map(|frame| {
@@ -1086,7 +1112,7 @@ fn write_u16_input(
     data: &[u16],
     channels: usize,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    levels: &Arc<Mutex<VecDeque<f32>>>,
+    levels: &SharedLevels,
 ) {
     write_input(
         data.chunks(channels).map(|frame| {
@@ -1104,7 +1130,7 @@ fn write_u16_input(
 fn write_input<I>(
     samples: I,
     writer: &Arc<Mutex<Option<WavWriter<BufWriter<File>>>>>,
-    levels: &Arc<Mutex<VecDeque<f32>>>,
+    levels: &SharedLevels,
 ) where
     I: Iterator<Item = f32>,
 {
@@ -1126,14 +1152,7 @@ fn write_input<I>(
         return;
     }
     let rms = (sum / count as f32).sqrt().clamp(0.0, 1.0);
-    if let Ok(mut levels) = levels.lock() {
-        let previous = levels.back().copied().unwrap_or(0.0);
-        let smoothed = previous * 0.72 + rms * 0.28;
-        if levels.len() >= LEVEL_HISTORY {
-            levels.pop_front();
-        }
-        levels.push_back(smoothed);
-    }
+    push_level(levels, rms);
 }
 
 fn accessibility_permission_granted() -> bool {
@@ -1377,7 +1396,19 @@ fn show_api_key_setup_prompt() {
 
         API_KEY_FIELD = field;
         API_KEY_STATUS_LABEL = status;
-        add_subviews(content, &[icon, title, body, input_box, input_label, field, status, save]);
+        add_subviews(
+            content,
+            &[
+                icon,
+                title,
+                body,
+                input_box,
+                input_label,
+                field,
+                status,
+                save,
+            ],
+        );
         let _: () = msg_send![window, center];
         let _: id = msg_send![window, retain];
         API_KEY_SETUP_WINDOW = window;
@@ -1715,7 +1746,10 @@ extern "C" fn open_accessibility_from_permission_window(_: &Object, _: Sel, send
     hide_permission_setup_window(sender);
     open_system_settings_privacy_pane("Privacy_Accessibility");
     set_active_permission_helper(PERMISSION_ACCESSIBILITY);
-    show_permission_drag_helper_panel("Accessibility", "Drag xhisperflow.app to the Accessibility list above");
+    show_permission_drag_helper_panel(
+        "Accessibility",
+        "Drag xhisperflow.app to the Accessibility list above",
+    );
     refresh_permission_buttons();
 }
 
@@ -1833,9 +1867,9 @@ fn update_permission_flow(accessibility_allowed: bool, microphone_allowed: bool)
             return;
         }
 
-        let active_permission_allowed =
-            (ACTIVE_PERMISSION_HELPER == PERMISSION_ACCESSIBILITY && accessibility_allowed)
-                || (ACTIVE_PERMISSION_HELPER == PERMISSION_MICROPHONE && microphone_allowed);
+        let active_permission_allowed = (ACTIVE_PERMISSION_HELPER == PERMISSION_ACCESSIBILITY
+            && accessibility_allowed)
+            || (ACTIVE_PERMISSION_HELPER == PERMISSION_MICROPHONE && microphone_allowed);
 
         if active_permission_allowed {
             let microphone_was_allowed =
@@ -1912,7 +1946,12 @@ fn system_settings_window_frame() -> Option<(f64, f64, f64, f64)> {
     let mut values = stdout
         .split(',')
         .filter_map(|value| value.trim().parse::<f64>().ok());
-    Some((values.next()?, values.next()?, values.next()?, values.next()?))
+    Some((
+        values.next()?,
+        values.next()?,
+        values.next()?,
+        values.next()?,
+    ))
 }
 
 fn close_system_settings_window() {
@@ -2021,15 +2060,7 @@ fn show_permission_drag_helper_panel(permission: &str, instruction: &str) {
         set_view_background(content, ns_color(0.13, 0.13, 0.15, 0.96), 0.0);
 
         let arrow = make_arrow_icon(62.0, 66.0);
-        let instruction = make_label(
-            instruction,
-            116.0,
-            72.0,
-            420.0,
-            24.0,
-            14.0,
-            true,
-        );
+        let instruction = make_label(instruction, 116.0, 72.0, 420.0, 24.0, 14.0, true);
         let fallback = make_label(
             "If dragging is blocked, click + and choose /Applications/xhisperflow.app.",
             116.0,
@@ -2183,7 +2214,15 @@ fn make_draggable_app_tile(x: f64, y: f64, width: f64, height: f64) -> id {
         set_view_background(tile, ns_color(0.16, 0.16, 0.18, 1.0), 6.0);
 
         let icon = make_app_icon_view(10.0, 4.0, 26.0, 26.0);
-        let label = make_label("xhisperflow.app", 48.0, 7.0, width - 60.0, 20.0, 13.0, false);
+        let label = make_label(
+            "xhisperflow.app",
+            48.0,
+            7.0,
+            width - 60.0,
+            20.0,
+            13.0,
+            false,
+        );
         add_subviews(tile, &[icon, label]);
         tile
     }
@@ -2228,7 +2267,11 @@ extern "C" fn draggable_app_hit_test(view: &Object, _: Sel, point: NSPoint) -> i
             && point.x <= bounds.origin.x + bounds.size.width
             && point.y >= bounds.origin.y
             && point.y <= bounds.origin.y + bounds.size.height;
-        if inside { view as *const Object as id } else { nil }
+        if inside {
+            view as *const Object as id
+        } else {
+            nil
+        }
     }
 }
 
@@ -2659,100 +2702,6 @@ fn modifiers_from_event_flags(flags: CGEventFlags) -> Modifiers {
     mods
 }
 
-fn draw_waveform(
-    buffer: &mut softbuffer::Buffer<'_, OwnedDisplayHandle, Rc<Window>>,
-    size: PhysicalSize<u32>,
-    levels: &[f32],
-    state: AppState,
-    gradient_start: HudColor,
-    gradient_end: HudColor,
-) {
-    let width = size.width.max(1);
-    let height = size.height.max(1);
-    for pixel in buffer.iter_mut() {
-        *pixel = rgb(0, 0, 0);
-    }
-
-    let waveform_bottom = height.saturating_sub(WAVEFORM_BOTTOM_PADDING).max(1);
-    let waveform_top = waveform_bottom.saturating_sub(WAVEFORM_HEIGHT);
-    let center = waveform_top + (waveform_bottom.saturating_sub(waveform_top) / 2);
-
-    let left = 42_u32;
-    let right = width.saturating_sub(42);
-    let bar_width = 3_u32;
-    let gap = 5_u32;
-    let stride = bar_width + gap;
-    let drawable_width = right.saturating_sub(left).max(1);
-    let bar_count = (drawable_width / stride).max(1);
-
-    for bar_index in 0..bar_count {
-        let x = left + bar_index * stride;
-        let progress = bar_index as f32 / bar_count.saturating_sub(1).max(1) as f32;
-        let color = gradient_start.mix(gradient_end, progress).to_pixel();
-        let raw_level = if levels.is_empty() {
-            0.18
-        } else {
-            let idx = (bar_index as usize * levels.len() / bar_count as usize)
-                .min(levels.len().saturating_sub(1));
-            let response = match state {
-                AppState::Recording => 1.8,
-                AppState::Transcribing => 0.9,
-                AppState::Pasting => 0.55,
-                AppState::Idle => 0.35,
-            };
-            (levels[idx].sqrt() * response).clamp(0.0, 1.0)
-        };
-        let level = shape_waveform_level(raw_level);
-        let distance_from_center = ((progress - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-        let taper = 1.0 - distance_from_center * 0.62;
-        let bar_height = (4.0 + level * taper * WAVEFORM_HEIGHT as f32).round() as u32;
-        let y = center.saturating_sub(bar_height / 2);
-        draw_waveform_bar(buffer, width, x, y, bar_width, bar_height, color);
-    }
-}
-
-fn shape_waveform_level(level: f32) -> f32 {
-    let normalized = ((level - WAVEFORM_LEVEL_FLOOR)
-        / (WAVEFORM_LEVEL_CEILING - WAVEFORM_LEVEL_FLOOR))
-        .clamp(0.0, 1.0);
-    normalized * normalized * (3.0 - 2.0 * normalized)
-}
-
-fn draw_waveform_bar(
-    buffer: &mut softbuffer::Buffer<'_, OwnedDisplayHandle, Rc<Window>>,
-    width: u32,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    color: u32,
-) {
-    if h <= 2 {
-        draw_rect(buffer, width, x, y, w, h, color);
-        return;
-    }
-
-    draw_rect(
-        buffer,
-        width,
-        x + 1,
-        y,
-        w.saturating_sub(2).max(1),
-        1,
-        color,
-    );
-    draw_rect(buffer, width, x, y + 1, w, h.saturating_sub(2), color);
-    draw_rect(
-        buffer,
-        width,
-        x + 1,
-        y + h.saturating_sub(1),
-        w.saturating_sub(2).max(1),
-        1,
-        color,
-    );
-}
-
 fn position_hud_at_notch(window: &Window) {
     let Ok(handle) = window.window_handle() else {
         return;
@@ -2913,80 +2862,6 @@ unsafe fn create_notch_mask_layer(width: f64, height: f64) -> id {
         let _: () = msg_send![mask, setPath: cg_path];
     }
     mask
-}
-
-fn draw_rect(
-    buffer: &mut softbuffer::Buffer<'_, OwnedDisplayHandle, Rc<Window>>,
-    width: u32,
-    x: u32,
-    y: u32,
-    w: u32,
-    h: u32,
-    color: u32,
-) {
-    let buffer_width = width as usize;
-    let buffer_len = buffer.len();
-    for row in y..y.saturating_add(h) {
-        let start = row as usize * buffer_width + x as usize;
-        if start >= buffer_len {
-            break;
-        }
-        let end = (start + w as usize).min(buffer_len);
-        for pixel in &mut buffer[start..end] {
-            *pixel = color;
-        }
-    }
-}
-
-#[derive(Clone, Copy, Debug)]
-struct HudColor {
-    r: u8,
-    g: u8,
-    b: u8,
-}
-
-impl HudColor {
-    const fn new(r: u8, g: u8, b: u8) -> Self {
-        Self { r, g, b }
-    }
-
-    fn mix(self, other: Self, amount: f32) -> Self {
-        let amount = amount.clamp(0.0, 1.0);
-        Self {
-            r: mix_channel(self.r, other.r, amount),
-            g: mix_channel(self.g, other.g, amount),
-            b: mix_channel(self.b, other.b, amount),
-        }
-    }
-
-    fn to_pixel(self) -> u32 {
-        rgb(u32::from(self.r), u32::from(self.g), u32::from(self.b))
-    }
-}
-
-fn parse_hex_color(value: &str, fallback: HudColor) -> HudColor {
-    let value = value.trim().trim_matches('"').trim_start_matches('#');
-    if value.len() != 6 {
-        return fallback;
-    }
-
-    let Ok(parsed) = u32::from_str_radix(value, 16) else {
-        return fallback;
-    };
-
-    HudColor::new(
-        ((parsed >> 16) & 0xff) as u8,
-        ((parsed >> 8) & 0xff) as u8,
-        (parsed & 0xff) as u8,
-    )
-}
-
-fn mix_channel(start: u8, end: u8, amount: f32) -> u8 {
-    (start as f32 + (end as f32 - start as f32) * amount).round() as u8
-}
-
-fn rgb(r: u32, g: u32, b: u32) -> u32 {
-    b | (g << 8) | (r << 16)
 }
 
 fn tray_icon() -> Result<Icon> {
