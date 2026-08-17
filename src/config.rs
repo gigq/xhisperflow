@@ -22,9 +22,9 @@ pub struct Config {
     pub hallucination_no_speech_threshold: f64,
     pub mac_hotkey: String,
     pub mac_cancel_hotkey: String,
-    pub mac_floating_waveform: bool,
-    pub mac_waveform_gradient_start: String,
-    pub mac_waveform_gradient_end: String,
+    pub floating_waveform: bool,
+    pub waveform_gradient_start: String,
+    pub waveform_gradient_end: String,
 }
 
 impl Default for Config {
@@ -41,10 +41,10 @@ impl Default for Config {
             non_ascii_default_delay_secs: 0.025,
             hallucination_no_speech_threshold: 0.1,
             mac_hotkey: "alt+space".to_string(),
-            mac_cancel_hotkey: "shift+esc".to_string(),
-            mac_floating_waveform: true,
-            mac_waveform_gradient_start: "#b58cff".to_string(),
-            mac_waveform_gradient_end: "#d7e6ff".to_string(),
+            mac_cancel_hotkey: "ctrl+shift".to_string(),
+            floating_waveform: true,
+            waveform_gradient_start: "#b58cff".to_string(),
+            waveform_gradient_end: "#d7e6ff".to_string(),
         }
     }
 }
@@ -121,16 +121,16 @@ impl Config {
                 "cancel-hotkey" => {
                     config.mac_cancel_hotkey = value;
                 }
-                "mac-floating-waveform" => {
+                "floating-waveform" | "mac-floating-waveform" => {
                     if let Some(parsed) = parse_bool(&value) {
-                        config.mac_floating_waveform = parsed;
+                        config.floating_waveform = parsed;
                     }
                 }
-                "mac-waveform-gradient-start" if !value.is_empty() => {
-                    config.mac_waveform_gradient_start = value;
+                "waveform-gradient-start" | "mac-waveform-gradient-start" if !value.is_empty() => {
+                    config.waveform_gradient_start = value;
                 }
-                "mac-waveform-gradient-end" if !value.is_empty() => {
-                    config.mac_waveform_gradient_end = value;
+                "waveform-gradient-end" | "mac-waveform-gradient-end" if !value.is_empty() => {
+                    config.waveform_gradient_end = value;
                 }
                 _ => {}
             }
@@ -181,9 +181,7 @@ fn parse_bool(input: &str) -> Option<bool> {
 fn strip_inline_comment(input: &str) -> String {
     let mut out = String::with_capacity(input.len());
     let mut in_quotes = false;
-    let mut chars = input.chars().peekable();
-
-    while let Some(ch) = chars.next() {
+    for ch in input.chars() {
         match ch {
             '"' => {
                 in_quotes = !in_quotes;
@@ -213,12 +211,12 @@ mod tests {
     }
 
     #[test]
-    fn mac_defaults_are_present() {
+    fn app_defaults_are_present() {
         let config = Config::default();
         assert_eq!(config.mac_hotkey, "alt+space");
-        assert_eq!(config.mac_cancel_hotkey, "shift+esc");
-        assert!(config.mac_floating_waveform);
-        assert_eq!(config.mac_waveform_gradient_start, "#b58cff");
-        assert_eq!(config.mac_waveform_gradient_end, "#d7e6ff");
+        assert_eq!(config.mac_cancel_hotkey, "ctrl+shift");
+        assert!(config.floating_waveform);
+        assert_eq!(config.waveform_gradient_start, "#b58cff");
+        assert_eq!(config.waveform_gradient_end, "#d7e6ff");
     }
 }

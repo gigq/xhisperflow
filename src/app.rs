@@ -1,5 +1,8 @@
 use crate::config::{Config, OutputMethod, home_dir};
 use crate::daemon::{ClientCommand, WrapKey, is_running, send_command};
+#[cfg(target_os = "linux")]
+use crate::linux_hud::LinuxHud;
+use crate::waveform::{WaveformColor, parse_hex_color, push_level, shared_levels};
 use anyhow::{Context, Result, bail};
 use reqwest::blocking::{Client, multipart};
 use serde_json::{Value, json};
@@ -35,6 +38,7 @@ Behavior:
 
 #[derive(Clone, Debug, Default)]
 pub struct RunOptions {
+    pub cancel: bool,
     pub print_log: bool,
     pub wrap_key: Option<WrapKey>,
 }
@@ -45,6 +49,10 @@ pub fn run(args: &[String]) -> Result<()> {
         print_log();
         return Ok(());
     }
+    if options.cancel {
+        cancel_recording()?;
+        return Ok(());
+    }
 
     load_home_env();
     let config = Config::load();
@@ -52,7 +60,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if let Some(pid) = active_recording_pid() {
         finish_recording(&config, &options, pid)?;
     } else {
-        start_recording()?;
+        start_recording(&config)?;
     }
 
     Ok(())
@@ -64,6 +72,7 @@ pub fn parse_args(args: &[String]) -> Result<RunOptions> {
     for arg in args {
         match arg.as_str() {
             "--local" => {}
+            "--cancel" => options.cancel = true,
             "--log" => options.print_log = true,
             "--leftalt" | "--rightalt" | "--leftctrl" | "--rightctrl" | "--leftshift"
             | "--rightshift" | "--super" => {
@@ -73,7 +82,7 @@ pub fn parse_args(args: &[String]) -> Result<RunOptions> {
                 options.wrap_key = WrapKey::from_flag(arg.trim_start_matches("--"));
             }
             _ => bail!(
-                "usage: xhisperflow [--local] [--log] [--leftalt|--rightalt|--leftctrl|--rightctrl|--leftshift|--rightshift|--super]"
+                "usage: xhisperflow [--local] [--cancel] [--log] [--leftalt|--rightalt|--leftctrl|--rightctrl|--leftshift|--rightshift|--super]"
             ),
         }
     }
@@ -90,9 +99,9 @@ fn print_log() {
     }
 }
 
-fn start_recording() -> Result<()> {
+fn start_recording(config: &Config) -> Result<()> {
     thread::sleep(Duration::from_millis(200));
-    upsert_notification("Recording", "", Some(0), 0)?;
+    upsert_notification("Recording", "", None, 0)?;
 
     let child = Command::new("pw-record")
         .args(["--channels=1", "--rate=16000", RECORDING_PATH])
@@ -105,7 +114,7 @@ fn start_recording() -> Result<()> {
     fs::write(RECORDING_PID_PATH, child.id().to_string())
         .context("failed to write recording pid")?;
 
-    let mut meter = LevelMeter::spawn(child.id());
+    let mut meter = LevelMeter::spawn(child.id(), config);
     let _ = wait_for_recording(child);
     meter.stop();
 
@@ -122,8 +131,6 @@ fn wait_for_recording(mut child: Child) -> Result<()> {
 }
 
 fn finish_recording(config: &Config, options: &RunOptions, pid: u32) -> Result<()> {
-    upsert_notification("Transcribing", "", None, 0)?;
-
     let stop_start = Instant::now();
     terminate_pid(pid).context("failed to stop pw-record")?;
     thread::sleep(Duration::from_millis(200));
@@ -133,17 +140,69 @@ fn finish_recording(config: &Config, options: &RunOptions, pid: u32) -> Result<(
         stop_start.elapsed(),
     )?;
 
-    let transcription = transcribe(config, Path::new(RECORDING_PATH))?;
-    let cleaned = post_process(config, &transcription)?;
+    #[cfg(target_os = "linux")]
+    let mut processing_hud = start_processing_hud(config);
+    #[cfg(target_os = "linux")]
+    if processing_hud.is_none() {
+        let _ = upsert_notification("Transcribing", "", None, 0);
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = upsert_notification("Transcribing", "", None, 0);
 
-    if !cleaned.trim().is_empty() {
-        let paste_start = Instant::now();
-        paste(config, options.wrap_key, &cleaned)?;
-        log_timed_step(
-            "Final paste",
-            &format!("Chars: {}", cleaned.chars().count()),
-            paste_start.elapsed(),
-        )?;
+    let result: Result<()> = (|| {
+        let transcription = transcribe(config, Path::new(RECORDING_PATH))?;
+        let cleaned = post_process(config, &transcription)?;
+
+        if !cleaned.trim().is_empty() {
+            let paste_start = Instant::now();
+            paste(config, options.wrap_key, &cleaned)?;
+            log_timed_step(
+                "Final paste",
+                &format!("Chars: {}", cleaned.chars().count()),
+                paste_start.elapsed(),
+            )?;
+        }
+        Ok(())
+    })();
+
+    #[cfg(target_os = "linux")]
+    if let Some(hud) = &mut processing_hud {
+        hud.stop();
+    }
+    dismiss_notification();
+    let _ = fs::remove_file(RECORDING_PATH);
+    let _ = fs::remove_file(RECORDING_PID_PATH);
+    result
+}
+
+#[cfg(target_os = "linux")]
+fn start_processing_hud(config: &Config) -> Option<LinuxHud> {
+    if !config.floating_waveform {
+        return None;
+    }
+
+    let (gradient_start, gradient_end) = waveform_colors(config);
+    match LinuxHud::spawn_processing(shared_levels(), gradient_start, gradient_end) {
+        Ok(hud) => {
+            dismiss_notification();
+            Some(hud)
+        }
+        Err(err) => {
+            eprintln!("falling back to transcription notification: {err:#}");
+            None
+        }
+    }
+}
+
+fn cancel_recording() -> Result<()> {
+    let Some(pid) = active_recording_pid() else {
+        return Ok(());
+    };
+
+    terminate_pid(pid).context("failed to cancel pw-record")?;
+    let started = Instant::now();
+    while pid_is_alive(pid) && started.elapsed() < Duration::from_secs(1) {
+        thread::sleep(Duration::from_millis(10));
     }
 
     dismiss_notification();
@@ -681,12 +740,19 @@ impl Clipboard {
 
 struct LevelMeter {
     child: Option<Child>,
+    #[cfg(target_os = "linux")]
+    hud: Option<LinuxHud>,
 }
 
 impl LevelMeter {
-    fn spawn(recording_pid: u32) -> Self {
-        if !(command_exists("notify-send") && command_exists("arecord")) {
-            return Self { child: None };
+    fn spawn(recording_pid: u32, config: &Config) -> Self {
+        let can_notify = command_exists("notify-send");
+        if !command_exists("arecord") || (!config.floating_waveform && !can_notify) {
+            return Self {
+                child: None,
+                #[cfg(target_os = "linux")]
+                hud: None,
+            };
         }
 
         let Ok(mut child) = Command::new("arecord")
@@ -698,6 +764,8 @@ impl LevelMeter {
                 "-r",
                 "16000",
                 "-c1",
+                "--period-time=33333",
+                "--buffer-time=133332",
                 "-vvv",
                 "/dev/null",
             ])
@@ -705,10 +773,37 @@ impl LevelMeter {
             .stderr(Stdio::piped())
             .spawn()
         else {
-            return Self { child: None };
+            return Self {
+                child: None,
+                #[cfg(target_os = "linux")]
+                hud: None,
+            };
         };
 
+        let levels = shared_levels();
+        #[cfg(target_os = "linux")]
+        let hud = config.floating_waveform.then(|| {
+            let (gradient_start, gradient_end) = waveform_colors(config);
+            LinuxHud::spawn_recording(levels.clone(), gradient_start, gradient_end)
+        });
+        #[cfg(target_os = "linux")]
+        let hud = hud.and_then(|result| match result {
+            Ok(hud) => Some(hud),
+            Err(err) => {
+                eprintln!("falling back to notification level meter: {err:#}");
+                None
+            }
+        });
+        #[cfg(target_os = "linux")]
+        let hud_active = hud.is_some();
+        #[cfg(not(target_os = "linux"))]
+        let hud_active = false;
+        if hud_active {
+            dismiss_notification();
+        }
+
         if let Some(stderr) = child.stderr.take() {
+            let levels = levels.clone();
             thread::spawn(move || {
                 let reader = BufReader::new(stderr);
                 let mut last_value = None;
@@ -722,8 +817,10 @@ impl LevelMeter {
                     let Some(raw) = extract_peak_hex(&line) else {
                         continue;
                     };
-                    let value = raw_peak_to_progress(raw);
-                    if last_value != Some(value) {
+                    let level = raw_peak_to_level(raw);
+                    let value = raw_peak_percent(raw);
+                    push_level(&levels, level);
+                    if !hud_active && can_notify && last_value != Some(value) {
                         let _ = upsert_notification("Recording", "", Some(value), 0);
                         last_value = Some(value);
                     }
@@ -731,13 +828,21 @@ impl LevelMeter {
             });
         }
 
-        Self { child: Some(child) }
+        Self {
+            child: Some(child),
+            #[cfg(target_os = "linux")]
+            hud,
+        }
     }
 
     fn stop(&mut self) {
         if let Some(child) = &mut self.child {
             let _ = child.kill();
             let _ = child.wait();
+        }
+        #[cfg(target_os = "linux")]
+        if let Some(hud) = &mut self.hud {
+            hud.stop();
         }
     }
 }
@@ -761,15 +866,31 @@ fn extract_peak_hex(line: &str) -> Option<u32> {
     u32::from_str_radix(&hex, 16).ok()
 }
 
-fn raw_peak_to_progress(raw: u32) -> u8 {
+fn raw_peak_to_level(raw: u32) -> f32 {
     if raw <= 64 {
-        return 0;
+        return 0.0;
     }
 
-    let min = (64_f64).ln();
-    let max = (4096_f64).ln();
-    let scaled = ((f64::from(raw).ln() - min) / (max - min) * 100.0).clamp(0.0, 100.0);
-    scaled.round() as u8
+    const S16_PEAK: f32 = i16::MAX as f32;
+    const SPEECH_PEAK_TO_RMS_RATIO: f32 = 4.5;
+    (raw.min(i16::MAX as u32) as f32 / S16_PEAK / SPEECH_PEAK_TO_RMS_RATIO).clamp(0.0, 1.0)
+}
+
+fn raw_peak_percent(raw: u32) -> u8 {
+    (raw.min(i16::MAX as u32) as f32 / i16::MAX as f32 * 100.0).round() as u8
+}
+
+fn waveform_colors(config: &Config) -> (WaveformColor, WaveformColor) {
+    (
+        parse_hex_color(
+            &config.waveform_gradient_start,
+            WaveformColor::new(181, 140, 255),
+        ),
+        parse_hex_color(
+            &config.waveform_gradient_end,
+            WaveformColor::new(215, 230, 255),
+        ),
+    )
 }
 
 fn get_notification_id() -> Option<String> {
@@ -803,10 +924,10 @@ fn upsert_notification(
         .stdout(Stdio::piped())
         .stderr(Stdio::null());
 
-    if let Some(replace_id) = get_notification_id() {
-        if replace_id.chars().all(|ch| ch.is_ascii_digit()) {
-            command.arg(format!("--replace-id={replace_id}"));
-        }
+    if let Some(replace_id) = get_notification_id()
+        && replace_id.chars().all(|ch| ch.is_ascii_digit())
+    {
+        command.arg(format!("--replace-id={replace_id}"));
     }
 
     if let Some(value) = value {
@@ -886,18 +1007,12 @@ pub fn install_default_config(path: impl AsRef<Path>) -> Result<()> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).context("failed to create config directory")?;
     }
-    fs::write(
-        path,
-        b"# xhisperflow configuration\n# Customize this file at the platform config path.\n# When in doubt, check by running 'xhisperflow --log'\n\n# Transcription Settings:\nlong-recording-threshold : 1000\ntranscription-prompt     : \"\"\npost-processing-enabled  : true\npost-processing-model    : \"openai/gpt-oss-20b\"\npost-processing-timeout  : 3\noutput-method            : \"type\"\nclipboard-restore-delay  : 0.15\n\n# Paste Timing (seconds):\nnon-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.\nnon-ascii-default-delay : 0.025\n\n# macOS App:\nhotkey                      : \"alt+space\"\ncancel-hotkey               : \"shift+esc\"\nmac-floating-waveform       : true\nmac-waveform-gradient-start : \"#b58cff\"\nmac-waveform-gradient-end   : \"#d7e6ff\"\n",
-    )
-    .context("failed to write default config")
+    fs::write(path, include_bytes!("../default_xhisperflowrc"))
+        .context("failed to write default config")
 }
 
 fn args_from_os() -> Vec<String> {
-    env::args_os()
-        .skip(1)
-        .map(|arg| os_to_string_lossy(arg))
-        .collect()
+    env::args_os().skip(1).map(os_to_string_lossy).collect()
 }
 
 pub fn run_xhisperflow_main() -> Result<()> {
@@ -914,4 +1029,25 @@ pub fn run_xhisperflowtoold_main() -> Result<()> {
 
 fn os_to_string_lossy(value: OsString) -> String {
     value.to_string_lossy().into_owned()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{parse_args, raw_peak_percent, raw_peak_to_level};
+
+    #[test]
+    fn parses_cancel_option() {
+        let options = parse_args(&["--cancel".to_string()]).unwrap();
+        assert!(options.cancel);
+        assert!(!options.print_log);
+        assert!(options.wrap_key.is_none());
+    }
+
+    #[test]
+    fn linux_peak_meter_preserves_speech_headroom() {
+        assert_eq!(raw_peak_to_level(64), 0.0);
+        assert!((0.02..0.04).contains(&raw_peak_to_level(0x1000)));
+        assert!((0.20..0.24).contains(&raw_peak_to_level(i16::MAX as u32)));
+        assert_eq!(raw_peak_percent(i16::MAX as u32), 100);
+    }
 }

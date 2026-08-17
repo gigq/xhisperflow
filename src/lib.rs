@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod waveform;
 
 #[cfg(target_os = "linux")]
 pub mod daemon;
@@ -69,3 +70,6 @@ pub mod daemon {
 
 #[cfg(target_os = "macos")]
 pub mod macos_app;
+
+#[cfg(target_os = "linux")]
+pub mod linux_hud;
