@@ -44,6 +44,19 @@ pub struct RunOptions {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "--transcribe-file") {
+        anyhow::ensure!(
+            args.len() == 2,
+            "usage: xhisperflow --transcribe-file <audio.wav>"
+        );
+        let path = Path::new(&args[1]);
+        anyhow::ensure!(path.is_file(), "Audio file does not exist");
+        load_home_env();
+        let config = Config::load();
+        let text = transcribe(&config, path)?;
+        println!("{}", post_process(&config, &text)?);
+        return Ok(());
+    }
     let options = parse_args(args)?;
     if options.print_log {
         print_log();
@@ -1034,6 +1047,18 @@ fn os_to_string_lossy(value: OsString) -> String {
 #[cfg(test)]
 mod tests {
     use super::{parse_args, raw_peak_percent, raw_peak_to_level};
+
+    #[test]
+    fn file_mode_rejects_missing_arguments_without_recording() {
+        assert!(super::run(&["--transcribe-file".into()]).is_err());
+        assert!(
+            super::run(&[
+                "--transcribe-file".into(),
+                "/does-not-exist/recording.wav".into()
+            ])
+            .is_err()
+        );
+    }
 
     #[test]
     fn parses_cancel_option() {

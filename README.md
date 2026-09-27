@@ -133,3 +133,17 @@ the existing `notify-send` level meter is used automatically.
 While recording, the waveform responds to the microphone level. During
 transcription, the same HUD switches to a repeating left-to-right ripple so the
 processing state is visually distinct from listening on both Linux and macOS.
+
+## File transcription for remote clients
+
+`xhisperflow --transcribe-file /path/to/audio.wav` transcribes an existing recording
+and writes only the final text to stdout (errors go to stderr). It uses the same
+Groq credentials, transcription prompt, and optional cleanup configuration as
+desktop dictation. It does not start recording, show a HUD, or change the clipboard
+or focused application. Audio is sent to Groq.
+
+For Omarchy Remote, set its host environment override:
+
+```sh
+OMARCHY_DICTATION_COMMAND='["xhisperflow","--transcribe-file","{audio}"]'
+```
