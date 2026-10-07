@@ -1,0 +1,32 @@
+#!/bin/bash
+set -euo pipefail
+
+config_dir="${XDG_CONFIG_HOME:-$HOME/.config}/xhisperflow"
+env_file="$config_dir/env"
+stamp_file="${XDG_RUNTIME_DIR:-/tmp}/xhisperflow-hotkey.stamp"
+cooldown_ms=350
+
+now_ms=$(date +%s%3N)
+if [[ -f "$stamp_file" ]]; then
+  last_ms=$(<"$stamp_file")
+  if [[ "$last_ms" =~ ^[0-9]+$ ]] && (( now_ms - last_ms < cooldown_ms )); then
+    exit 0
+  fi
+fi
+printf '%s\n' "$now_ms" >"$stamp_file"
+
+if [[ -f "$env_file" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_file"
+  set +a
+fi
+
+if ! command -v xhisperflow >/dev/null 2>&1; then
+  notify-send "xhisperflow not installed" "Expected xhisperflow in PATH." >/dev/null 2>&1 || true
+  exit 1
+fi
+
+# xhisperflow validates credentials only for the selected cloud backend.
+# A local Voxtype transcription does not need a Groq API key.
+exec xhisperflow "$@"

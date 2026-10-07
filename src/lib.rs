@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+mod voxtype;
 pub mod waveform;
 
 #[cfg(target_os = "linux")]

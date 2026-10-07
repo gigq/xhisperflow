@@ -3,6 +3,12 @@
 # When in doubt, check by running 'xhisperflow --log'
 
 # Transcription Settings:
+# Linux: auto prefers an installed voxtype, otherwise Groq. macOS keeps Groq.
+# Set groq or voxtype to select a specific Linux backend.
+transcription-backend   : "auto"
+# Voxtype uses its own model/config; optional Groq cleanup is off for local speech.
+voxtype-post-processing-enabled : false
+voxtype-timeout         : 120
 long-recording-threshold : 1000
 transcription-prompt     : ""
 post-processing-enabled  : true

@@ -51,8 +51,8 @@ pub fn run(args: &[String]) -> Result<()> {
         );
         let path = Path::new(&args[1]);
         anyhow::ensure!(path.is_file(), "Audio file does not exist");
-        load_home_env();
         let config = Config::load();
+        load_backend_env(&config);
         let text = transcribe(&config, path)?;
         println!("{}", post_process(&config, &text)?);
         return Ok(());
@@ -67,12 +67,15 @@ pub fn run(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    load_home_env();
     let config = Config::load();
+    load_backend_env(&config);
 
     if let Some(pid) = active_recording_pid() {
         finish_recording(&config, &options, pid)?;
     } else {
+        if needs_groq(&config) {
+            groq_api_key()?;
+        }
         start_recording(&config)?;
     }
 
@@ -393,7 +396,36 @@ fn ensure_helper_available(needs_helper: bool, wrap_key_needed: bool) -> Result<
     bail!("failed to start xhisperflowtoold");
 }
 
+fn use_voxtype(config: &Config) -> bool {
+    config
+        .transcription_backend
+        .use_voxtype(cfg!(target_os = "linux"), command_exists("voxtype"))
+}
+
+fn needs_groq(config: &Config) -> bool {
+    !use_voxtype(config)
+        || (config.post_processing_enabled && config.voxtype_post_processing_enabled)
+}
+
+fn load_backend_env(config: &Config) {
+    if needs_groq(config) && env::var_os("GROQ_API_KEY").is_none() {
+        load_home_env();
+    }
+}
+
 pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
+    if use_voxtype(config) {
+        let logging_start = Instant::now();
+        let binary = which("voxtype")
+            .context("Voxtype backend selected, but voxtype is not installed on PATH")?;
+        let text = crate::voxtype::transcribe(
+            &binary,
+            recording,
+            Duration::from_secs(config.voxtype_timeout_secs),
+        )?;
+        log_timed_step("Transcription (Voxtype)", &text, logging_start.elapsed())?;
+        return Ok(text);
+    }
     let logging_start = Instant::now();
     let api_key = groq_api_key()?;
     let duration = wav_duration_seconds(recording).unwrap_or(0.0);
@@ -444,7 +476,10 @@ pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
 }
 
 pub(crate) fn post_process(config: &Config, transcript: &str) -> Result<String> {
-    if !config.post_processing_enabled || transcript.trim().is_empty() {
+    if !config.post_processing_enabled
+        || (use_voxtype(config) && !config.voxtype_post_processing_enabled)
+        || transcript.trim().is_empty()
+    {
         return Ok(transcript.to_string());
     }
 

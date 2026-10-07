@@ -1,7 +1,8 @@
 # xhisperflow
 
 xhisperflow is a lightweight dictation app that records your voice, transcribes
-it with `whisper-large-v3-turbo` on Groq, optionally cleans up the text with
+it locally with Voxtype on Linux when installed (otherwise with
+`whisper-large-v3-turbo` on Groq), optionally cleans up the text with
 `openai/gpt-oss-20b`, and inserts the final transcript into the app you were
 using.
 
@@ -15,7 +16,8 @@ waveform HUD while recording.
 
 ## Features
 
-- Fast voice transcription using `whisper-large-v3-turbo`, with
+- Optional local Voxtype transcription on Linux with the existing waveform, processing animation, hotkeys, and paste behavior.
+- Cloud voice transcription using `whisper-large-v3-turbo`, with
   `whisper-large-v3` used for long recordings.
 - Optional post-processing cleanup with `openai/gpt-oss-20b` for punctuation,
   capitalization, and wording.
@@ -116,7 +118,39 @@ Copy [default_xhisperflowrc](./default_xhisperflowrc) to:
 ~/.config/xhisperflow/xhisperflowrc
 ```
 
-`GROQ_API_KEY` is read from the environment or `~/.env`.
+On Linux, `transcription-backend : "auto"` prefers `voxtype` when it is executable
+on `PATH`; otherwise it uses Groq. Set it to `"groq"` to keep the original backend,
+or `"voxtype"` to require the local CLI. macOS retains the existing Groq backend
+and onboarding; these backend-selection settings currently apply to Linux only.
+
+Voxtype receives the completed WAV via `voxtype --quiet transcribe <file>`.
+xhisperflow still owns recording, its waveform and processing animation, cancel,
+and pasting. It does not start Voxtype's daemon or its overlay. Voxtype uses its
+own configured model and engine. File transcription loads the model per invocation,
+so it may take longer than Voxtype's already-running daemon; benchmark on your host.
+In auto mode only a missing executable selects Groq: a local transcription error
+is reported, never silently retried against the cloud.
+
+Groq still honors `post-processing-enabled`. The Voxtype path skips that cloud
+cleanup by default; opt in with `voxtype-post-processing-enabled : true` while
+`post-processing-enabled` is also true. `voxtype-timeout : 120` bounds the local
+transcription process in seconds. A hung process is terminated and no text pasted.
+Voxtype can itself be configured for a remote engine; this adapter does not override
+its configuration.
+
+`GROQ_API_KEY` is read from the environment or `~/.env` and is required only for
+Groq transcription or the optional Groq cleanup. Existing Linux hotkey wrappers
+that unconditionally require this key must be updated: `scripts/xhisperflow-toggle`
+loads the existing environment and keeps the release-event debounce, then lets
+xhisperflow validate the selected backend. Install it with:
+
+```sh
+install -Dm755 scripts/xhisperflow-toggle ~/.local/bin/xhisperflow-toggle
+```
+
+Control+Option and Control+Shift can keep their existing toggle/cancel bindings to
+xhisperflow. The new backend does not require changing the bindings or deleting
+any existing Groq credentials.
 
 On Linux, bind `xhisperflow` to start or finish dictation and bind
 `xhisperflow --cancel` to discard the current recording without transcription.
@@ -138,9 +172,9 @@ processing state is visually distinct from listening on both Linux and macOS.
 
 `xhisperflow --transcribe-file /path/to/audio.wav` transcribes an existing recording
 and writes only the final text to stdout (errors go to stderr). It uses the same
-Groq credentials, transcription prompt, and optional cleanup configuration as
-desktop dictation. It does not start recording, show a HUD, or change the clipboard
-or focused application. Audio is sent to Groq.
+selected backend and optional cleanup configuration as desktop dictation. It does not start recording, show a HUD, or change the clipboard
+or focused application. The Groq backend sends audio to Groq; the Voxtype backend
+uses the host's Voxtype engine configuration.
 
 For Omarchy Remote, set its host environment override:
 
