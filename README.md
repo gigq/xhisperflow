@@ -158,6 +158,22 @@ On Linux, bind `xhisperflow` to start or finish dictation and bind
 `xhisperflow --cancel` to discard the current recording without transcription.
 Global shortcuts are configured by the desktop environment or compositor.
 
+### Fast text insertion on Linux
+
+Set `output-method : "paste"` to insert the entire transcript in one clipboard
+paste instead of simulating a keypress for every character. This Wayland mode
+requires `wl-copy` and `wtype`, waits for clipboard ownership, and allows 100 ms for
+the virtual keyboard to initialize before sending the shortcut. It avoids the
+legacy helper daemon and `--paste-once`, which clipboard managers can consume.
+
+`paste-keys : "ctrl+v"` works in normal text fields. Use `"ctrl+shift+v"` for a
+terminal emulator or `"shift+insert"` where appropriate. This mode leaves the
+transcript on the clipboard so a slow clipboard read cannot race restoration;
+it never automatically submits your message. Simulated typing remains available
+with `output-method : "type"` (also given a short device-initialization pause).
+The existing `"clipboard"` helper mode remains available for compatibility.
+These modes affect insertion, not transcription accuracy.
+
 ### Linux waveform HUD
 
 On Wayland, xhisperflow uses the `wlr-layer-shell` protocol to place the HUD at

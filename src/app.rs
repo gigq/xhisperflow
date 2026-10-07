@@ -228,6 +228,14 @@ fn cancel_recording() -> Result<()> {
 }
 
 fn paste(config: &Config, wrap_key: Option<WrapKey>, text: &str) -> Result<()> {
+    if matches!(config.output_method, OutputMethod::Paste) {
+        ensure_helper_available(wrap_key.is_some(), wrap_key.is_some())?;
+        press_wrap_key(wrap_key)?;
+        let result = crate::paste::wayland(text, &config.paste_keys);
+        // Release an explicitly requested wrap key even if copying/pasting failed.
+        let release = press_wrap_key(wrap_key);
+        return result.and(release);
+    }
     if matches!(config.output_method, OutputMethod::Clipboard) {
         ensure_helper_available(true, wrap_key.is_some())?;
         press_wrap_key(wrap_key)?;
@@ -249,6 +257,7 @@ fn paste(config: &Config, wrap_key: Option<WrapKey>, text: &str) -> Result<()> {
 fn paste_by_typing(config: &Config, text: &str, has_wtype: bool) -> Result<()> {
     if has_wtype {
         let status = Command::new("wtype")
+            .args(["-s", "100", "--"])
             .arg(text)
             .status()
             .context("failed to run wtype")?;

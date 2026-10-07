@@ -6,6 +6,7 @@ use std::path::PathBuf;
 pub enum OutputMethod {
     Type,
     Clipboard,
+    Paste,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -38,6 +39,7 @@ pub struct Config {
     pub post_processing_model: String,
     pub post_processing_timeout_secs: f64,
     pub output_method: OutputMethod,
+    pub paste_keys: String,
     pub clipboard_restore_delay_secs: f64,
     pub non_ascii_initial_delay_secs: f64,
     pub non_ascii_default_delay_secs: f64,
@@ -61,6 +63,7 @@ impl Default for Config {
             post_processing_model: "openai/gpt-oss-20b".to_string(),
             post_processing_timeout_secs: 3.0,
             output_method: OutputMethod::Type,
+            paste_keys: "ctrl+v".to_string(),
             clipboard_restore_delay_secs: 0.15,
             non_ascii_initial_delay_secs: 0.1,
             non_ascii_default_delay_secs: 0.025,
@@ -147,8 +150,10 @@ impl Config {
                 "output-method" => match value.to_ascii_lowercase().as_str() {
                     "type" => config.output_method = OutputMethod::Type,
                     "clipboard" => config.output_method = OutputMethod::Clipboard,
+                    "paste" => config.output_method = OutputMethod::Paste,
                     _ => {}
                 },
+                "paste-keys" => config.paste_keys = value,
                 "clipboard-restore-delay" => {
                     if let Ok(parsed) = value.parse::<f64>() {
                         config.clipboard_restore_delay_secs = parsed;

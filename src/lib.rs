@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+mod paste;
 mod voxtype;
 pub mod waveform;
 
@@ -74,3 +75,8 @@ pub mod macos_app;
 
 #[cfg(target_os = "linux")]
 pub mod linux_hud;
+
+// Avoid ETXTBSY when concurrent fork/exec tests inherit another fixture's
+// briefly-open script writer. Only the subprocess fixtures take this lock.
+#[cfg(test)]
+static PROCESS_FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

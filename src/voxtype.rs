@@ -86,19 +86,29 @@ mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
 
-    fn fixture(script: &str) -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {
+    fn fixture(
+        script: &str,
+    ) -> (
+        std::sync::MutexGuard<'static, ()>,
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let guard = crate::PROCESS_FIXTURE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let dir = tempfile::tempdir().unwrap();
         let binary = dir.path().join("voxtype");
         std::fs::write(&binary, format!("#!/bin/sh\n{script}\n")).unwrap();
         std::fs::set_permissions(&binary, std::fs::Permissions::from_mode(0o700)).unwrap();
         let recording = dir.path().join("recording with spaces.wav");
         std::fs::write(&recording, "fixture").unwrap();
-        (dir, binary, recording)
+        (guard, dir, binary, recording)
     }
 
     #[test]
     fn returns_only_transcript_and_passes_audio_as_one_argument() {
-        let (_dir, binary, recording) = fixture(
+        let (_guard, _dir, binary, recording) = fixture(
             r#"
             test "$#" = 3 && test "$1" = --quiet && test "$2" = transcribe && test -f "$3" || exit 2
             echo 'model diagnostics' >&2
@@ -113,7 +123,7 @@ mod tests {
 
     #[test]
     fn silence_remains_empty() {
-        let (_dir, binary, recording) = fixture(
+        let (_guard, _dir, binary, recording) = fixture(
             "echo 'Loading audio file: fixture.wav'; echo 'No speech detected, skipping transcription.'",
         );
         assert_eq!(
@@ -124,7 +134,7 @@ mod tests {
 
     #[test]
     fn local_failure_is_reported_instead_of_switching_to_cloud() {
-        let (_dir, binary, recording) = fixture("echo 'model missing' >&2; exit 7");
+        let (_guard, _dir, binary, recording) = fixture("echo 'model missing' >&2; exit 7");
         let error = transcribe(&binary, &recording, Duration::from_secs(2))
             .unwrap_err()
             .to_string();
@@ -142,7 +152,7 @@ mod tests {
 
     #[test]
     fn hung_transcription_is_killed() {
-        let (_dir, binary, recording) = fixture("exec sleep 5");
+        let (_guard, _dir, binary, recording) = fixture("exec sleep 5");
         let start = Instant::now();
         assert!(
             transcribe(&binary, &recording, Duration::from_millis(50))

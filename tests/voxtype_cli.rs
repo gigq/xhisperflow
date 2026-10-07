@@ -3,7 +3,10 @@ use std::fs;
 use std::os::unix::fs::PermissionsExt;
 use std::process::{Command, Output};
 
+static FIXTURE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 fn run(backend: &str, script: Option<&str>, cleanup: bool) -> Output {
+    let _guard = FIXTURE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = tempfile::tempdir().unwrap();
     let config_dir = dir.path().join("xhisperflow");
     fs::create_dir(&config_dir).unwrap();

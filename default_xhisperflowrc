@@ -14,7 +14,10 @@ transcription-prompt     : ""
 post-processing-enabled  : true
 post-processing-model    : "openai/gpt-oss-20b"
 post-processing-timeout  : 3
+# Linux Wayland: use "paste" for a single fast clipboard paste (wl-copy + wtype).
+# "type" keeps simulated typing; "clipboard" keeps the legacy helper path.
 output-method            : "type"
+paste-keys               : "ctrl+v" # also ctrl+shift+v or shift+insert
 clipboard-restore-delay  : 0.15
 
 # Paste Timing (seconds):
