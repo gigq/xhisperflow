@@ -124,6 +124,8 @@ or `"voxtype"` to require the local CLI. macOS retains the existing Groq backend
 and onboarding; these backend-selection settings currently apply to Linux only.
 
 Voxtype receives the completed WAV via `voxtype --quiet transcribe <file>`.
+Its loading/audio-format/progress preamble is removed before cleanup or paste;
+unrecognized output produces an error rather than inserting diagnostics.
 xhisperflow still owns recording, its waveform and processing animation, cancel,
 and pasting. It does not start Voxtype's daemon or its overlay. Voxtype uses its
 own configured model and engine. File transcription loads the model per invocation,

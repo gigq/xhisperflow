@@ -51,7 +51,27 @@ pub(crate) fn transcribe(binary: &Path, recording: &Path, timeout: Duration) -> 
         stdout.metadata()?.len() <= 1024 * 1024,
         "Voxtype transcript exceeds 1 MiB"
     );
-    Ok(read_output(&mut stdout, 1024 * 1024)?.trim().to_string())
+    transcript(&read_output(&mut stdout, 1024 * 1024)?)
+}
+
+// Voxtype's file command prints a diagnostic preamble to stdout even with
+// --quiet. Only the text after its blank separator is dictated output.
+fn transcript(output: &str) -> Result<String> {
+    let output = output.replace("\r\n", "\n");
+    let output = output.trim();
+    if !output.contains("\n\n")
+        && output.lines().last() == Some("No speech detected, skipping transcription.")
+    {
+        return Ok(String::new());
+    }
+    let (preamble, text) = output
+        .split_once("\n\n")
+        .context("Unexpected Voxtype output: missing transcript separator; nothing was pasted")?;
+    ensure!(
+        preamble.starts_with("Loading audio file:"),
+        "Unexpected Voxtype output: unrecognized preamble; nothing was pasted"
+    );
+    Ok(text.trim().to_string())
 }
 
 fn read_output(file: &mut File, limit: u64) -> Result<String> {
@@ -82,7 +102,7 @@ mod tests {
             r#"
             test "$#" = 3 && test "$1" = --quiet && test "$2" = transcribe && test -f "$3" || exit 2
             echo 'model diagnostics' >&2
-            printf '  Hello, world.\n'
+            printf 'Loading audio file: %s\nAudio format: 16000 Hz, 1 channel(s), Int\nProcessing 60047 samples (3.75s)...\n\n  Hello, world.\n' "$3"
         "#,
         );
         assert_eq!(
@@ -93,7 +113,9 @@ mod tests {
 
     #[test]
     fn silence_remains_empty() {
-        let (_dir, binary, recording) = fixture("printf '\\n'");
+        let (_dir, binary, recording) = fixture(
+            "echo 'Loading audio file: fixture.wav'; echo 'No speech detected, skipping transcription.'",
+        );
         assert_eq!(
             transcribe(&binary, &recording, Duration::from_secs(2)).unwrap(),
             ""
@@ -108,6 +130,14 @@ mod tests {
             .to_string();
         assert!(error.contains("model missing"));
         assert!(error.contains("7"));
+    }
+
+    #[test]
+    fn diagnostic_output_cannot_become_dictated_text() {
+        assert!(transcript("Loading audio file: fixture.wav\nAudio format: 16000 Hz").is_err());
+        assert!(transcript("Unknown diagnostics\n\nmore diagnostics").is_err());
+        assert!(transcript("").is_err());
+        assert_eq!(transcript("Loading audio file: fixture.wav\r\nProcessing 12 samples\r\n\r\nFirst paragraph.\r\n\r\nSecond paragraph.\r\n").unwrap(), "First paragraph.\n\nSecond paragraph.");
     }
 
     #[test]

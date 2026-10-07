@@ -32,7 +32,13 @@ fn run(backend: &str, script: Option<&str>, cleanup: bool) -> Output {
 
 #[test]
 fn auto_uses_installed_voxtype_without_a_key_or_cloud_cleanup() {
-    let out = run("auto", Some("printf 'Local transcript.\\n'"), false);
+    let out = run(
+        "auto",
+        Some(
+            "printf 'Loading audio file: fixture.wav\\nAudio format: 16000 Hz, 1 channel(s), Int\\nProcessing 60047 samples (3.75s)...\\n\\nLocal transcript.\\n'",
+        ),
+        false,
+    );
     assert!(
         out.status.success(),
         "{}",
@@ -63,7 +69,25 @@ fn local_failure_and_missing_explicit_dependency_do_not_fall_back() {
 
 #[test]
 fn optional_cloud_cleanup_requires_a_key() {
-    let out = run("voxtype", Some("echo 'Local transcript.'"), true);
+    let out = run(
+        "voxtype",
+        Some(
+            "printf 'Loading audio file: fixture.wav\\nProcessing 12 samples\\n\\nLocal transcript.\\n'",
+        ),
+        true,
+    );
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("GROQ_API_KEY is not set"));
+}
+
+#[test]
+fn diagnostics_without_a_transcript_are_not_printed() {
+    let out = run(
+        "voxtype",
+        Some("echo 'Loading audio file: fixture.wav'"),
+        false,
+    );
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("missing transcript separator"));
 }
