@@ -1,0 +1,12 @@
+[Unit]
+Description=xhisperflow built-in Whisper transcription
+After=graphical-session.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/xhisperflow --transcription-daemon
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,8 +1,8 @@
 # xhisperflow
 
 xhisperflow is a lightweight dictation app that records your voice, transcribes
-it locally with Voxtype on Linux when installed (otherwise with
-`whisper-large-v3-turbo` on Groq), optionally cleans up the text with
+it locally with a built-in Whisper worker on Linux and macOS (or with
+Voxtype on Linux / Groq in the cloud), optionally cleans up the text with
 `openai/gpt-oss-20b`, and inserts the final transcript into the app you were
 using.
 
@@ -16,6 +16,7 @@ waveform HUD while recording.
 
 ## Features
 
+- Built-in resident Whisper worker: keeps the model and inference state loaded between recordings, with Vulkan on Linux and Metal on macOS. No Voxtype install or cloud key required.
 - Optional local Voxtype transcription on Linux with the existing waveform, processing animation, hotkeys, and paste behavior.
 - Cloud voice transcription using `whisper-large-v3-turbo`, with
   `whisper-large-v3` used for long recordings.
@@ -38,11 +39,68 @@ waveform HUD while recording.
 cargo build --bins
 ```
 
-This produces:
+This produces `target/debug/xhisperflow`, `target/debug/xhisperflowtool`, and
+`target/debug/xhisperflowtoold`.
 
-- `target/debug/xhisperflow`
-- `target/debug/xhisperflowtool`
-- `target/debug/xhisperflowtoold`
+Native transcription requires CMake, a C/C++ compiler, and libclang at build
+time. For Linux GPU acceleration, install Vulkan headers and `glslc`, then
+build with `cargo build --release --features vulkan --bin xhisperflow`.
+CPU transcription is included by default; `--no-default-features` omits Whisper.
+
+## Built-in local transcription (Linux and macOS)
+
+Download a model once:
+
+```sh
+scripts/setup-local-transcription.sh large-v3-turbo
+```
+
+Set these in xhisperflowrc (or leave `auto`, which selects the built-in worker
+when its model is installed):
+
+```text
+transcription-backend : "local"
+local-model : "large-v3-turbo"
+local-language : "en"
+```
+
+Models live in `$XDG_DATA_HOME/xhisperflow/models` (normally
+`~/.local/share/xhisperflow/models`) on Linux and
+`~/Library/Application Support/xhisperflow/models` on macOS. `local-model` can
+also be an absolute GGML `.bin` path. No model is bundled in the release archive.
+
+The app starts a per-user worker from its own executable and warms it while you
+record (at app launch on macOS). Recordings travel over a private Unix socket;
+the worker keeps the model and inference state loaded across requests and
+resamples native Mac microphone rates to 16 kHz. xhisperflow owns recording,
+the waveform, cancellation, optional cleanup, and paste on both platforms.
+Local failures are reported without silently uploading audio to a cloud service.
+`local-post-processing-enabled : true` explicitly enables Groq cleanup if
+`post-processing-enabled` is also true; the default is false, with no API-key
+onboarding for local transcription on macOS.
+
+Inspect or stop the worker:
+
+```sh
+xhisperflow --transcription-status
+xhisperflow --stop-transcription-daemon
+```
+
+On macOS these flags also work on
+`xhisperflow.app/Contents/MacOS/xhisperflow`, before the menu bar UI is started.
+Stop/restart the worker after changing its model, language, GPU, or thread count.
+On Linux, an optional login service preloads it before the first hotkey:
+
+```sh
+install -Dm644 scripts/xhisperflow-transcription.service ~/.config/systemd/user/xhisperflow-transcription.service
+systemctl --user daemon-reload
+systemctl --user enable --now xhisperflow-transcription.service
+```
+
+With that service installed, restart it with
+`systemctl --user restart xhisperflow-transcription.service`. Stop any auto-started worker
+before first enabling the service. macOS uses the same executable/worker
+protocol; `scripts/build-macos-app.sh` enables Metal and embeds its shader library.
 
 ## Release builds
 
@@ -67,7 +125,7 @@ The release workflow publishes a Linux tarball and a universal macOS DMG.
 ## macOS
 
 The macOS app is a native Rust menu bar app with a global recording hotkey,
-floating waveform HUD, Groq-hosted transcription, and paste into the active app.
+floating waveform HUD, built-in local or Groq-hosted transcription, and paste into the active app.
 
 Build the app bundle:
 
@@ -118,10 +176,12 @@ Copy [default_xhisperflowrc](./default_xhisperflowrc) to:
 ~/.config/xhisperflow/xhisperflowrc
 ```
 
-On Linux, `transcription-backend : "auto"` prefers `voxtype` when it is executable
-on `PATH`; otherwise it uses Groq. Set it to `"groq"` to keep the original backend,
+`transcription-backend : "auto"` first prefers the built-in worker when its
+model is installed. Otherwise, on Linux it prefers `voxtype` when executable
+on `PATH`, then Groq. Set it to `"groq"` to keep the original cloud backend,
 or `"voxtype"` to require the local CLI. macOS retains the existing Groq backend
-and onboarding; these backend-selection settings currently apply to Linux only.
+and onboarding when the built-in model is not installed. Explicit `local` works
+on both platforms; the external Voxtype adapter remains Linux-only.
 
 Voxtype receives the completed WAV via `voxtype --quiet transcribe <file>`.
 Its loading/audio-format/progress preamble is removed before cleanup or paste;

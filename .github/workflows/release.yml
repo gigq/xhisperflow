@@ -22,8 +22,13 @@ jobs:
       - name: Derive release version
         run: echo "RELEASE_VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_ENV"
 
+      - name: Install native transcription build dependencies
+        run: sudo apt-get update && sudo apt-get install -y cmake clang libclang-dev libvulkan-dev glslc
+
       - name: Build Linux binaries
-        run: cargo build --release --bin xhisperflow --bin xhisperflowtool --bin xhisperflowtoold
+        env:
+          GGML_NATIVE: "OFF"
+        run: cargo build --release --features vulkan --bin xhisperflow --bin xhisperflowtool --bin xhisperflowtoold
 
       - name: Package Linux release
         run: |
@@ -33,6 +38,8 @@ jobs:
           cp target/release/xhisperflowtool "dist/$PACKAGE/"
           cp target/release/xhisperflowtoold "dist/$PACKAGE/"
           cp default_xhisperflowrc "dist/$PACKAGE/"
+          cp scripts/setup-local-transcription.sh "dist/$PACKAGE/"
+          cp scripts/xhisperflow-transcription.service "dist/$PACKAGE/"
           tar -C dist -czf "dist/$PACKAGE.tar.gz" "$PACKAGE"
           shasum -a 256 "dist/$PACKAGE.tar.gz" > "dist/$PACKAGE.tar.gz.sha256"
 

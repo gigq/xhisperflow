@@ -26,6 +26,7 @@ fn run(backend: &str, script: Option<&str>, cleanup: bool) -> Output {
         .arg("--transcribe-file")
         .arg(wav)
         .env("XDG_CONFIG_HOME", dir.path())
+        .env("XDG_DATA_HOME", dir.path())
         .env("PATH", dir.path())
         // Deliberately empty means unavailable, without consulting the user's .env.
         .env("GROQ_API_KEY", "")

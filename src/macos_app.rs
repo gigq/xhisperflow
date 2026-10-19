@@ -81,6 +81,18 @@ const LOGIN_AGENT_LABEL: &str = "com.gigq.xhisperflow";
 type HudSurface = Surface<OwnedDisplayHandle, Rc<Window>>;
 
 pub fn run() -> Result<()> {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    if args.first().is_some_and(|arg| {
+        matches!(
+            arg.as_str(),
+            "--transcription-daemon"
+                | "--transcription-status"
+                | "--stop-transcription-daemon"
+                | "--transcribe-file"
+        )
+    }) {
+        return crate::app::run(&args);
+    }
     load_home_env();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
@@ -206,6 +218,7 @@ impl MacHotKey {
 impl MacApp {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
         let config = Config::load();
+        crate::app::prewarm_local(&config);
         let hotkey = parse_hotkey_binding(&config.mac_hotkey)?;
         let hotkey_manager =
             GlobalHotKeyManager::new().context("failed to create global hotkey manager")?;
@@ -432,7 +445,7 @@ impl MacApp {
             self.open_permissions_help();
             return;
         }
-        if !groq_api_key_present() {
+        if crate::app::needs_groq(&self.config) && !groq_api_key_present() {
             self.set_status("Groq API key required");
             self.open_api_key_setup();
             return;
@@ -548,7 +561,9 @@ impl MacApp {
                 self.state = AppState::Idle;
                 self.set_status(&format!("Transcription failed: {err}"));
                 self.show_hud(true);
-                if !groq_api_key_present() || err.contains("GROQ_API_KEY") {
+                if crate::app::needs_groq(&self.config)
+                    && (!groq_api_key_present() || err.contains("GROQ_API_KEY"))
+                {
                     self.open_api_key_setup();
                 }
             }
@@ -678,6 +693,7 @@ impl MacApp {
 
     fn maybe_prompt_for_api_key(&mut self) {
         if self.api_key_prompted
+            || !crate::app::needs_groq(&self.config)
             || groq_api_key_present()
             || !required_permissions_granted()
             || permission_flow_needs_polling()

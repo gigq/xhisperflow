@@ -44,6 +44,16 @@ pub struct RunOptions {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args == ["--transcription-daemon"] {
+        return crate::local::run_daemon(&Config::load());
+    }
+    if args == ["--transcription-status"] {
+        println!("{}", crate::local::status()?);
+        return Ok(());
+    }
+    if args == ["--stop-transcription-daemon"] {
+        return crate::local::stop();
+    }
     if args.first().is_some_and(|arg| arg == "--transcribe-file") {
         anyhow::ensure!(
             args.len() == 2,
@@ -73,6 +83,7 @@ pub fn run(args: &[String]) -> Result<()> {
     if let Some(pid) = active_recording_pid() {
         finish_recording(&config, &options, pid)?;
     } else {
+        prewarm_local(&config);
         if needs_groq(&config) {
             groq_api_key()?;
         }
@@ -406,12 +417,35 @@ fn ensure_helper_available(needs_helper: bool, wrap_key_needed: bool) -> Result<
 }
 
 fn use_voxtype(config: &Config) -> bool {
-    config
-        .transcription_backend
-        .use_voxtype(cfg!(target_os = "linux"), command_exists("voxtype"))
+    !use_local(config)
+        && config
+            .transcription_backend
+            .use_voxtype(cfg!(target_os = "linux"), command_exists("voxtype"))
 }
 
-fn needs_groq(config: &Config) -> bool {
+pub(crate) fn use_local(config: &Config) -> bool {
+    use crate::config::TranscriptionBackend;
+    config.transcription_backend == TranscriptionBackend::Local
+        || (config.transcription_backend == TranscriptionBackend::Auto
+            && cfg!(feature = "local-whisper")
+            && crate::local::model_path(config).is_file())
+}
+
+pub(crate) fn prewarm_local(config: &Config) {
+    if use_local(config) {
+        let config = config.clone();
+        thread::spawn(move || {
+            if let Err(err) = crate::local::ensure_running(&config) {
+                eprintln!("Local transcription warmup failed: {err:#}");
+            }
+        });
+    }
+}
+
+pub(crate) fn needs_groq(config: &Config) -> bool {
+    if use_local(config) {
+        return config.post_processing_enabled && config.local_post_processing_enabled;
+    }
     !use_voxtype(config)
         || (config.post_processing_enabled && config.voxtype_post_processing_enabled)
 }
@@ -423,6 +457,12 @@ fn load_backend_env(config: &Config) {
 }
 
 pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
+    if use_local(config) {
+        let start = Instant::now();
+        let text = crate::local::transcribe(config, recording)?;
+        log_timed_step("Transcription (built-in Whisper)", &text, start.elapsed())?;
+        return Ok(text);
+    }
     if use_voxtype(config) {
         let logging_start = Instant::now();
         let binary = which("voxtype")
@@ -486,6 +526,7 @@ pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
 
 pub(crate) fn post_process(config: &Config, transcript: &str) -> Result<String> {
     if !config.post_processing_enabled
+        || (use_local(config) && !config.local_post_processing_enabled)
         || (use_voxtype(config) && !config.voxtype_post_processing_enabled)
         || transcript.trim().is_empty()
     {
@@ -1091,6 +1132,25 @@ fn os_to_string_lossy(value: OsString) -> String {
 #[cfg(test)]
 mod tests {
     use super::{parse_args, raw_peak_percent, raw_peak_to_level};
+
+    #[test]
+    fn built_in_transcription_does_not_require_cloud_credentials_on_either_platform() {
+        let mut config = crate::config::Config {
+            transcription_backend: crate::config::TranscriptionBackend::Local,
+            ..Default::default()
+        };
+        assert!(super::use_local(&config));
+        assert!(!super::use_voxtype(&config));
+        assert!(!super::needs_groq(&config));
+        assert_eq!(
+            super::post_process(&config, "Local text.").unwrap(),
+            "Local text."
+        );
+        config.local_post_processing_enabled = true;
+        assert!(super::needs_groq(&config));
+        config.post_processing_enabled = false;
+        assert!(!super::needs_groq(&config));
+    }
 
     #[test]
     fn file_mode_rejects_missing_arguments_without_recording() {

@@ -1,5 +1,6 @@
 pub mod app;
 pub mod config;
+pub mod local;
 mod paste;
 mod voxtype;
 pub mod waveform;

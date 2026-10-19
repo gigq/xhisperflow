@@ -14,6 +14,7 @@ pub enum TranscriptionBackend {
     Auto,
     Groq,
     Voxtype,
+    Local,
 }
 
 impl TranscriptionBackend {
@@ -23,6 +24,7 @@ impl TranscriptionBackend {
             && match self {
                 Self::Auto => installed,
                 Self::Groq => false,
+                Self::Local => false,
                 Self::Voxtype => true,
             }
     }
@@ -33,6 +35,12 @@ pub struct Config {
     pub transcription_backend: TranscriptionBackend,
     pub voxtype_post_processing_enabled: bool,
     pub voxtype_timeout_secs: u64,
+    pub local_model: String,
+    pub local_language: String,
+    pub local_threads: i32,
+    pub local_gpu_device: i32,
+    pub local_timeout_secs: u64,
+    pub local_post_processing_enabled: bool,
     pub long_recording_threshold: f64,
     pub transcription_prompt: String,
     pub post_processing_enabled: bool,
@@ -57,6 +65,12 @@ impl Default for Config {
             transcription_backend: TranscriptionBackend::Auto,
             voxtype_post_processing_enabled: false,
             voxtype_timeout_secs: 120,
+            local_model: "large-v3-turbo".into(),
+            local_language: "en".into(),
+            local_threads: 4,
+            local_gpu_device: 0,
+            local_timeout_secs: 120,
+            local_post_processing_enabled: false,
             long_recording_threshold: 1000.0,
             transcription_prompt: String::new(),
             post_processing_enabled: true,
@@ -109,11 +123,34 @@ impl Config {
                     "auto" => config.transcription_backend = TranscriptionBackend::Auto,
                     "groq" => config.transcription_backend = TranscriptionBackend::Groq,
                     "voxtype" => config.transcription_backend = TranscriptionBackend::Voxtype,
+                    "local" => config.transcription_backend = TranscriptionBackend::Local,
                     _ => {
                         eprintln!("Unknown transcription-backend {value:?}; using auto");
                         config.transcription_backend = TranscriptionBackend::Auto;
                     }
                 },
+                "local-model" if !value.is_empty() => config.local_model = value,
+                "local-language" if !value.is_empty() => config.local_language = value,
+                "local-threads" => {
+                    if let Ok(n @ 1..=256) = value.parse() {
+                        config.local_threads = n;
+                    }
+                }
+                "local-gpu-device" => {
+                    if let Ok(n @ 0..=15) = value.parse() {
+                        config.local_gpu_device = n;
+                    }
+                }
+                "local-timeout" => {
+                    if let Ok(n @ 1..=3600) = value.parse() {
+                        config.local_timeout_secs = n;
+                    }
+                }
+                "local-post-processing-enabled" => {
+                    if let Some(enabled) = parse_bool(&value) {
+                        config.local_post_processing_enabled = enabled;
+                    }
+                }
                 "voxtype-post-processing-enabled" => {
                     if let Some(parsed) = parse_bool(&value) {
                         config.voxtype_post_processing_enabled = parsed;
@@ -265,9 +302,28 @@ mod tests {
         assert!(!Auto.use_voxtype(true, false));
         assert!(!Groq.use_voxtype(true, true));
         assert!(Voxtype.use_voxtype(true, false));
-        for backend in [Auto, Groq, Voxtype] {
+        for backend in [Auto, Groq, Voxtype, Local] {
             assert!(!backend.use_voxtype(false, true));
         }
+    }
+
+    #[test]
+    fn parses_shared_local_backend_and_bounds_worker_settings() {
+        let config = Config::from_contents(
+            "transcription-backend : local\nlocal-model : \"/tmp/a model.bin\"\nlocal-language : auto\nlocal-threads : 8\nlocal-gpu-device : 1\nlocal-timeout : 30\nlocal-post-processing-enabled : true",
+        );
+        assert_eq!(config.transcription_backend, TranscriptionBackend::Local);
+        assert_eq!(config.local_model, "/tmp/a model.bin");
+        assert_eq!(config.local_language, "auto");
+        assert_eq!(config.local_threads, 8);
+        assert_eq!(config.local_gpu_device, 1);
+        assert_eq!(config.local_timeout_secs, 30);
+        assert!(config.local_post_processing_enabled);
+        let invalid =
+            Config::from_contents("local-threads : 0\nlocal-timeout : 0\nlocal-gpu-device : -1");
+        assert_eq!(invalid.local_threads, 4);
+        assert_eq!(invalid.local_timeout_secs, 120);
+        assert_eq!(invalid.local_gpu_device, 0);
     }
 
     #[test]

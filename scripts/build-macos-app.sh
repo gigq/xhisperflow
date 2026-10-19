@@ -53,10 +53,10 @@ build_slice() {
   target="$(target_for_arch "$arch")"
 
   if [[ -n "$target" ]]; then
-    cargo build --release --bin xhisperflow-mac --target "$target"
+    GGML_NATIVE=OFF cargo build --release --features metal --bin xhisperflow-mac --target "$target"
     printf '%s\n' "$ROOT_DIR/target/$target/release/xhisperflow-mac"
   else
-    cargo build --release --bin xhisperflow-mac
+    GGML_NATIVE=OFF cargo build --release --features metal --bin xhisperflow-mac
     printf '%s\n' "$ROOT_DIR/target/release/xhisperflow-mac"
   fi
 }
