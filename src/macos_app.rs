@@ -86,6 +86,7 @@ pub fn run() -> Result<()> {
         matches!(
             arg.as_str(),
             "--transcription-daemon"
+                | "--select-model"
                 | "--transcription-status"
                 | "--stop-transcription-daemon"
                 | "--transcribe-file"
@@ -435,6 +436,10 @@ impl MacApp {
     }
 
     fn start_recording(&mut self) {
+        // The CLI model selector updates the shared config while the menu bar
+        // app remains running. Snapshot the selected backend for this take.
+        self.config = Config::load();
+        crate::app::prewarm_local(&self.config);
         if microphone_restart_required() {
             self.set_status("Restart required");
             show_microphone_restart_prompt();
@@ -693,7 +698,7 @@ impl MacApp {
 
     fn maybe_prompt_for_api_key(&mut self) {
         if self.api_key_prompted
-            || !crate::app::needs_groq(&self.config)
+            || !crate::app::needs_groq(&Config::load())
             || groq_api_key_present()
             || !required_permissions_granted()
             || permission_flow_needs_polling()

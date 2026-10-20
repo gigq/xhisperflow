@@ -1,5 +1,5 @@
 [Unit]
-Description=xhisperflow built-in Whisper transcription
+Description=xhisperflow built-in speech transcription
 After=graphical-session.target
 
 [Service]

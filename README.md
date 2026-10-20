@@ -49,6 +49,46 @@ CPU transcription is included by default; `--no-default-features` omits Whisper.
 
 ## Built-in local transcription (Linux and macOS)
 
+The resident worker supports Whisper and Parakeet TDT v3. Whisper can use Vulkan
+or Metal; Parakeet currently runs on CPU and stays loaded between takes. Both
+are compiled into the default build, including the same worker used by the Mac
+menu bar app. No Voxtype executable or ONNX Runtime system install is needed.
+
+To compare Parakeet with Whisper, install both models once and select one:
+
+```sh
+scripts/setup-local-transcription.sh large-v3-turbo
+scripts/setup-local-transcription.sh parakeet
+xhisperflow --select-model parakeet
+xhisperflow --select-model whisper
+```
+
+`parakeet` selects the quantized `parakeet-tdt-0.6b-v3-int8` model. The full
+`parakeet-tdt-0.6b-v3` export can also be installed and selected by that exact
+name. Parakeet emits punctuation and capitalization, detects the spoken language
+within its supported set, and transcribes speech in that language; it does not
+translate it or use Whisper's text prompt. Model source:
+[NVIDIA Parakeet TDT v3](https://huggingface.co/nvidia/parakeet-tdt-0.6b-v3).
+The Parakeet installer uses Python 3.8+ and curl to download and verify the model
+files against their size and SHA-256 manifest; neither is needed for inference.
+
+The selector preserves other configuration, checks that the target model is
+installed, and reloads the worker. On Linux it restarts the active user service;
+otherwise it restarts the app's own worker. A failed load restores the previous
+configuration. The Mac app reads the selected backend at the start of each take.
+Status output includes `engine` as well as the model and resident PID.
+
+Equivalent settings for Parakeet are:
+
+```text
+transcription-backend : "local"
+local-engine : "parakeet"
+local-model : "parakeet-tdt-0.6b-v3-int8"
+```
+
+Use `local-engine : "whisper"` with a Whisper model. `local-threads` controls
+CPU threads for both engines; `local-gpu-device` applies to Whisper only.
+
 Download a model once:
 
 ```sh
@@ -60,6 +100,7 @@ when its model is installed):
 
 ```text
 transcription-backend : "local"
+local-engine : "whisper"
 local-model : "large-v3-turbo"
 local-language : "en"
 ```

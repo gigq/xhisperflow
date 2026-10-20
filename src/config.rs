@@ -36,6 +36,7 @@ pub struct Config {
     pub voxtype_post_processing_enabled: bool,
     pub voxtype_timeout_secs: u64,
     pub local_model: String,
+    pub local_engine: String,
     pub local_language: String,
     pub local_threads: i32,
     pub local_gpu_device: i32,
@@ -66,6 +67,7 @@ impl Default for Config {
             voxtype_post_processing_enabled: false,
             voxtype_timeout_secs: 120,
             local_model: "large-v3-turbo".into(),
+            local_engine: "whisper".into(),
             local_language: "en".into(),
             local_threads: 4,
             local_gpu_device: 0,
@@ -130,6 +132,9 @@ impl Config {
                     }
                 },
                 "local-model" if !value.is_empty() => config.local_model = value,
+                "local-engine" if matches!(value.as_str(), "whisper" | "parakeet") => {
+                    config.local_engine = value
+                }
                 "local-language" if !value.is_empty() => config.local_language = value,
                 "local-threads" => {
                     if let Ok(n @ 1..=256) = value.parse() {
@@ -310,10 +315,11 @@ mod tests {
     #[test]
     fn parses_shared_local_backend_and_bounds_worker_settings() {
         let config = Config::from_contents(
-            "transcription-backend : local\nlocal-model : \"/tmp/a model.bin\"\nlocal-language : auto\nlocal-threads : 8\nlocal-gpu-device : 1\nlocal-timeout : 30\nlocal-post-processing-enabled : true",
+            "transcription-backend : local\nlocal-engine : parakeet\nlocal-model : \"/tmp/a model.bin\"\nlocal-language : auto\nlocal-threads : 8\nlocal-gpu-device : 1\nlocal-timeout : 30\nlocal-post-processing-enabled : true",
         );
         assert_eq!(config.transcription_backend, TranscriptionBackend::Local);
         assert_eq!(config.local_model, "/tmp/a model.bin");
+        assert_eq!(config.local_engine, "parakeet");
         assert_eq!(config.local_language, "auto");
         assert_eq!(config.local_threads, 8);
         assert_eq!(config.local_gpu_device, 1);

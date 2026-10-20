@@ -1,4 +1,4 @@
-//! Built-in Whisper worker shared by the Linux CLI and macOS menu bar app.
+//! Built-in speech worker shared by the Linux CLI and macOS menu bar app.
 //! One per-user process owns the model and inference state; clients send WAV paths
 //! over a private Unix socket. It never records, pastes, or calls a cloud service.
 use crate::config::{Config, home_dir};
@@ -6,10 +6,8 @@ use anyhow::{Context, Result, bail, ensure};
 use serde_json::{Value, json};
 use std::fs::{self, OpenOptions};
 use std::io::{BufRead, BufReader, Read, Write};
-#[cfg(feature = "local-whisper")]
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
-#[cfg(feature = "local-whisper")]
 use std::os::unix::net::UnixListener;
 use std::os::unix::net::UnixStream;
 use std::os::unix::process::CommandExt;
@@ -37,10 +35,32 @@ pub fn model_path(config: &Config) -> PathBuf {
     let path = PathBuf::from(&config.local_model);
     if path.is_absolute() {
         path
+    } else if config.local_engine == "parakeet" {
+        data_dir().join("models").join(&config.local_model)
     } else {
         data_dir()
             .join("models")
             .join(format!("ggml-{}.bin", config.local_model))
+    }
+}
+
+pub fn engine_compiled(config: &Config) -> bool {
+    (config.local_engine == "whisper" && cfg!(feature = "local-whisper"))
+        || (config.local_engine == "parakeet" && cfg!(feature = "local-parakeet"))
+}
+
+pub fn model_available(config: &Config) -> bool {
+    let path = model_path(config);
+    if config.local_engine == "parakeet" {
+        path.join("vocab.txt").is_file()
+            && ["encoder-model.int8.onnx", "encoder-model.onnx"]
+                .iter()
+                .any(|f| path.join(f).is_file())
+            && ["decoder_joint-model.int8.onnx", "decoder_joint-model.onnx"]
+                .iter()
+                .any(|f| path.join(f).is_file())
+    } else {
+        path.is_file()
     }
 }
 
@@ -55,6 +75,18 @@ fn runtime_dir() -> PathBuf {
 
 fn socket_path() -> PathBuf {
     runtime_dir().join("transcription.sock")
+}
+
+fn worker_lock_available() -> bool {
+    let Ok(lock) = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(runtime_dir().join("transcription.lock"))
+    else {
+        return true;
+    };
+    // The fd closes immediately after this probe and releases the test lock.
+    unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
 fn private_dir(path: &Path) -> Result<()> {
@@ -117,11 +149,12 @@ pub fn ensure_running(config: &Config) -> Result<UnixStream> {
         Err(err) => return Err(err).context("Cannot connect to local transcription worker"),
     }
     ensure!(
-        cfg!(feature = "local-whisper"),
-        "Rebuild xhisperflow with the local-whisper feature"
+        engine_compiled(config),
+        "Rebuild xhisperflow with the local-{} feature",
+        config.local_engine
     );
     ensure!(
-        model_path(config).is_file(),
+        model_available(config),
         "Local model not found: {}. Run scripts/setup-local-transcription.sh first.",
         model_path(config).display()
     );
@@ -170,7 +203,7 @@ pub fn transcribe(config: &Config, recording: &Path) -> Result<String> {
     let mut stream = ensure_running(config)?;
     send_message(
         &mut stream,
-        &json!({"file": path, "model": model_path(config), "language": config.local_language,
+        &json!({"file": path, "engine": config.local_engine, "model": model_path(config), "language": config.local_language,
         "prompt": config.transcription_prompt}),
     )?;
     transcript_response(read_message(&mut stream)?)
@@ -206,9 +239,132 @@ pub fn stop() -> Result<()> {
     Ok(())
 }
 
-#[cfg(feature = "local-whisper")]
+fn selected_config(contents: &str, engine: &str, model: &str) -> String {
+    let mut result = contents
+        .lines()
+        .filter(|line| {
+            !line.split_once(':').is_some_and(|(key, _)| {
+                matches!(
+                    key.trim(),
+                    "transcription-backend" | "local-engine" | "local-model"
+                )
+            })
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    result.push_str(&format!("\ntranscription-backend : \"local\"\nlocal-engine : \"{engine}\"\nlocal-model : \"{model}\"\n"));
+    result
+}
+
+fn write_config(path: &Path, contents: &str) -> Result<()> {
+    let parent = path.parent().context("Config needs a parent directory")?;
+    fs::create_dir_all(parent)?;
+    let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
+    if let Ok(meta) = fs::metadata(path) {
+        temporary.as_file().set_permissions(meta.permissions())?;
+    }
+    temporary.write_all(contents.as_bytes())?;
+    temporary.persist(path)?;
+    Ok(())
+}
+
+pub fn select_model(name: &str) -> Result<()> {
+    let (engine, model) = match name {
+        "whisper" | "large-v3-turbo" => ("whisper", "large-v3-turbo"),
+        "parakeet" | "parakeet-tdt-0.6b-v3-int8" => ("parakeet", "parakeet-tdt-0.6b-v3-int8"),
+        "parakeet-tdt-0.6b-v3" => ("parakeet", "parakeet-tdt-0.6b-v3"),
+        _ => bail!("Choose whisper or parakeet"),
+    };
+    let mut config = Config::load();
+    config.local_engine = engine.into();
+    config.local_model = model.into();
+    ensure!(
+        engine_compiled(&config),
+        "This build does not include local-{engine}"
+    );
+    ensure!(
+        model_available(&config),
+        "Model not installed: {}. Run setup-local-transcription.sh {model} first.",
+        model_path(&config).display()
+    );
+    ensure!(
+        !Path::new("/tmp/xhisperflow-recording.pid").exists(),
+        "Finish or cancel the current recording before switching models"
+    );
+    let path = crate::config::config_file_path();
+    let original = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(e.into()),
+    };
+    // Preserve login preloading when the Linux worker is service-managed.
+    let managed = cfg!(target_os = "linux")
+        && Command::new("systemctl")
+            .args([
+                "--user",
+                "is-active",
+                "--quiet",
+                "xhisperflow-transcription.service",
+            ])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .is_ok_and(|s| s.success());
+    write_config(&path, &selected_config(&original, engine, model))?;
+    let result = (|| -> Result<()> {
+        if managed {
+            ensure!(
+                Command::new("systemctl")
+                    .args(["--user", "restart", "xhisperflow-transcription.service"])
+                    .status()?
+                    .success(),
+                "Worker service restart failed"
+            );
+        } else {
+            if status().is_ok() {
+                stop()?;
+                let start = Instant::now();
+                while !worker_lock_available() && start.elapsed() < Duration::from_secs(10) {
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                ensure!(worker_lock_available(), "Previous worker did not shut down");
+            }
+            drop(ensure_running(&config)?);
+        }
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(config.local_timeout_secs) {
+            if let Ok(ready) = status() {
+                ensure!(
+                    ready
+                        .get("engine")
+                        .and_then(Value::as_str)
+                        .unwrap_or("whisper")
+                        == engine
+                        && ready.get("model") == Some(&json!(model_path(&config))),
+                    "Worker loaded the wrong model"
+                );
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        bail!("Selected model did not become ready")
+    })();
+    if let Err(error) = result {
+        write_config(&path, &original)
+            .context("Could not restore previous config after model load failed")?;
+        if managed {
+            let _ = Command::new("systemctl")
+                .args(["--user", "restart", "xhisperflow-transcription.service"])
+                .status();
+        } else {
+            let _ = stop();
+        }
+        return Err(error).context("Model switch failed; previous configuration restored");
+    }
+    Ok(())
+}
+
 pub fn run_daemon(config: &Config) -> Result<()> {
-    use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
     private_dir(&runtime_dir())?;
     let lock = OpenOptions::new()
         .create(true)
@@ -224,22 +380,13 @@ pub fn run_daemon(config: &Config) -> Result<()> {
         return Ok(());
     }
     let path = model_path(config);
-    ensure!(path.is_file(), "Local model not found: {}", path.display());
     ensure!(
-        config.local_language == "auto"
-            || whisper_rs::get_lang_id(&config.local_language).is_some(),
-        "Unknown local-language"
+        model_available(config),
+        "Local model incomplete or missing: {}",
+        path.display()
     );
     let started = Instant::now();
-    let mut context_params = WhisperContextParameters::default();
-    context_params
-        .use_gpu(true)
-        .gpu_device(config.local_gpu_device);
-    let context = WhisperContext::new_with_params(
-        path.to_str().context("Invalid model path")?,
-        context_params,
-    )?;
-    let mut state = context.create_state()?;
+    let mut engine = crate::local_engine::Engine::load(config, &path)?;
     let socket = socket_path();
     match fs::remove_file(&socket) {
         Ok(()) => {}
@@ -249,7 +396,8 @@ pub fn run_daemon(config: &Config) -> Result<()> {
     let listener = UnixListener::bind(&socket)?;
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     eprintln!(
-        "Local Whisper ready: model={}, pid={}, loaded in {:.3}s",
+        "Local {} ready: model={}, pid={}, loaded in {:.3}s",
+        config.local_engine,
         path.display(),
         std::process::id(),
         started.elapsed().as_secs_f64()
@@ -270,7 +418,7 @@ pub fn run_daemon(config: &Config) -> Result<()> {
         if request.get("status").and_then(Value::as_bool) == Some(true) {
             let _ = send_message(
                 &mut stream,
-                &json!({"ready":true, "model":path, "pid":std::process::id(), "language":config.local_language}),
+                &json!({"ready":true, "engine":config.local_engine, "model":path, "pid":std::process::id(), "language":config.local_language}),
             );
             continue;
         }
@@ -278,8 +426,13 @@ pub fn run_daemon(config: &Config) -> Result<()> {
         let result: Result<String> = (|| {
             ensure!(
                 request.get("model") == Some(&json!(path))
+                    && request
+                        .get("engine")
+                        .and_then(Value::as_str)
+                        .unwrap_or("whisper")
+                        == config.local_engine
                     && request.get("language") == Some(&json!(config.local_language)),
-                "Worker model/language differs from config; restart the transcription worker"
+                "Worker engine/model/language differs from config; restart the transcription worker"
             );
             let file = request
                 .get("file")
@@ -289,40 +442,8 @@ pub fn run_daemon(config: &Config) -> Result<()> {
             if samples.is_empty() || samples.iter().all(|sample| sample.abs() < 0.00001) {
                 return Ok(String::new());
             }
-            let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-            params.set_n_threads(config.local_threads);
-            params.set_language(if config.local_language == "auto" {
-                None
-            } else {
-                Some(&config.local_language)
-            });
-            params.set_translate(false);
-            params.set_no_context(true);
-            params.set_print_special(false);
-            params.set_print_progress(false);
-            params.set_print_realtime(false);
-            params.set_print_timestamps(false);
-            params.set_suppress_blank(true);
-            params.set_suppress_nst(true);
             let prompt = request.get("prompt").and_then(Value::as_str).unwrap_or("");
-            if !prompt.is_empty() {
-                params.set_initial_prompt(prompt);
-            }
-            // Match the existing short-dictation path without padding every
-            // recording's encoder work out to a full 30-second context.
-            let duration = samples.len() as f32 / 16000.0;
-            if duration < 30.0 {
-                params.set_single_segment(true);
-                if duration <= 22.5 {
-                    params.set_audio_ctx((((duration * 50.0) as i32 + 128).max(384) + 7) / 8 * 8);
-                }
-            }
-            state.full(params, &samples)?;
-            let mut text = String::new();
-            for segment in state.as_iter() {
-                text.push_str(segment.to_str()?);
-            }
-            Ok(text.trim().to_owned())
+            engine.transcribe(config, &samples, prompt)
         })();
         let response = match result {
             Ok(text) => json!({"text":text}),
@@ -340,12 +461,6 @@ pub fn run_daemon(config: &Config) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "local-whisper"))]
-pub fn run_daemon(_config: &Config) -> Result<()> {
-    bail!("Rebuild xhisperflow with the local-whisper feature")
-}
-
-#[cfg(any(feature = "local-whisper", test))]
 fn read_audio(path: &Path) -> Result<Vec<f32>> {
     ensure!(
         fs::metadata(path)?.len() <= 128 * 1024 * 1024,
@@ -380,7 +495,6 @@ fn read_audio(path: &Path) -> Result<Vec<f32>> {
     resample(samples, spec.sample_rate)
 }
 
-#[cfg(any(feature = "local-whisper", test))]
 fn resample(samples: Vec<f32>, rate: u32) -> Result<Vec<f32>> {
     use rubato::{FftFixedIn, Resampler};
     if rate == 16000 || samples.is_empty() {
@@ -410,6 +524,38 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_preserves_unrelated_settings_and_removes_duplicate_overrides() {
+        let original = "# my dictation\nlocal-model : old\noutput-method : paste\nlocal-model : duplicate\nlocal-engine : whisper\ntranscription-backend : auto\n";
+        let updated = selected_config(original, "parakeet", "parakeet-tdt-0.6b-v3-int8");
+        assert!(updated.contains("# my dictation\noutput-method : paste"));
+        assert_eq!(updated.matches("local-model :").count(), 1);
+        assert_eq!(updated.matches("local-engine :").count(), 1);
+        assert!(updated.contains("local-engine : \"parakeet\""));
+        assert!(updated.contains("transcription-backend : \"local\""));
+    }
+
+    #[test]
+    fn parakeet_requires_both_networks_and_vocabulary() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = Config {
+            local_engine: "parakeet".into(),
+            local_model: dir.path().to_str().unwrap().into(),
+            ..Default::default()
+        };
+        assert!(!model_available(&config));
+        for name in [
+            "encoder-model.int8.onnx",
+            "decoder_joint-model.int8.onnx",
+            "vocab.txt",
+        ] {
+            fs::write(dir.path().join(name), "fixture").unwrap();
+        }
+        assert!(model_available(&config));
+        fs::remove_file(dir.path().join("decoder_joint-model.int8.onnx")).unwrap();
+        assert!(!model_available(&config));
+    }
 
     #[test]
     fn protocol_preserves_paths_spaces_and_multiline_text() {

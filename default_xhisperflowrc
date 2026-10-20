@@ -7,6 +7,7 @@
 # on Linux, otherwise Groq. Set local, groq, or voxtype explicitly if desired.
 transcription-backend   : "auto"
 # Run scripts/setup-local-transcription.sh to install the built-in model.
+local-engine            : "whisper" # or parakeet; --select-model handles both settings
 local-model             : "large-v3-turbo" # model name or absolute .bin path
 local-language          : "en" # or auto
 local-threads           : 4

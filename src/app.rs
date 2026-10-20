@@ -44,6 +44,15 @@ pub struct RunOptions {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args.first().is_some_and(|arg| arg == "--select-model") {
+        anyhow::ensure!(
+            args.len() == 2,
+            "usage: xhisperflow --select-model whisper|parakeet"
+        );
+        crate::local::select_model(&args[1])?;
+        println!("{}", crate::local::status()?);
+        return Ok(());
+    }
     if args == ["--transcription-daemon"] {
         return crate::local::run_daemon(&Config::load());
     }
@@ -427,8 +436,8 @@ pub(crate) fn use_local(config: &Config) -> bool {
     use crate::config::TranscriptionBackend;
     config.transcription_backend == TranscriptionBackend::Local
         || (config.transcription_backend == TranscriptionBackend::Auto
-            && cfg!(feature = "local-whisper")
-            && crate::local::model_path(config).is_file())
+            && crate::local::engine_compiled(config)
+            && crate::local::model_available(config))
 }
 
 pub(crate) fn prewarm_local(config: &Config) {
