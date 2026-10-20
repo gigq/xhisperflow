@@ -2,12 +2,15 @@
 # Download the standalone worker's model on Linux or macOS. No Voxtype needed.
 set -euo pipefail
 model="${1:-large-v3-turbo}"
+if [[ "$model" == qwen || "$model" == Qwen3-ASR-1.7B-Q8_0 ]]; then
+  exec bash "$(dirname -- "$0")/setup-local-qwen.sh"
+fi
 engine=whisper
 case "$model" in
   tiny|tiny.en|base|base.en|small|small.en|medium|medium.en|large-v3|large-v3-turbo) ;;
   parakeet) model=parakeet-tdt-0.6b-v3-int8; engine=parakeet ;;
   parakeet-tdt-0.6b-v3|parakeet-tdt-0.6b-v3-int8) engine=parakeet ;;
-  *) echo "Unsupported Whisper model: $model" >&2; exit 1 ;;
+  *) echo "Unsupported local model: $model" >&2; exit 1 ;;
 esac
 if [[ "$(uname -s)" == Darwin ]]; then
   data_dir="$HOME/Library/Application Support/xhisperflow"

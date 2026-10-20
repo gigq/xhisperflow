@@ -42,6 +42,8 @@ pub struct Config {
     pub local_gpu_device: i32,
     pub local_timeout_secs: u64,
     pub local_post_processing_enabled: bool,
+    pub local_cleanup_enabled: bool,
+    pub local_cleanup_timeout_ms: u64,
     pub long_recording_threshold: f64,
     pub transcription_prompt: String,
     pub post_processing_enabled: bool,
@@ -73,6 +75,8 @@ impl Default for Config {
             local_gpu_device: 0,
             local_timeout_secs: 120,
             local_post_processing_enabled: false,
+            local_cleanup_enabled: false,
+            local_cleanup_timeout_ms: 750,
             long_recording_threshold: 1000.0,
             transcription_prompt: String::new(),
             post_processing_enabled: true,
@@ -132,7 +136,7 @@ impl Config {
                     }
                 },
                 "local-model" if !value.is_empty() => config.local_model = value,
-                "local-engine" if matches!(value.as_str(), "whisper" | "parakeet") => {
+                "local-engine" if matches!(value.as_str(), "whisper" | "parakeet" | "qwen") => {
                     config.local_engine = value
                 }
                 "local-language" if !value.is_empty() => config.local_language = value,
@@ -154,6 +158,16 @@ impl Config {
                 "local-post-processing-enabled" => {
                     if let Some(enabled) = parse_bool(&value) {
                         config.local_post_processing_enabled = enabled;
+                    }
+                }
+                "local-cleanup-enabled" => {
+                    if let Some(enabled) = parse_bool(&value) {
+                        config.local_cleanup_enabled = enabled;
+                    }
+                }
+                "local-cleanup-timeout-ms" => {
+                    if let Ok(value @ 50..=3000) = value.parse() {
+                        config.local_cleanup_timeout_ms = value;
                     }
                 }
                 "voxtype-post-processing-enabled" => {

@@ -5,6 +5,7 @@ use std::path::Path;
 // Only the selected model is instantiated. Both engines live in the same
 // resident worker and use the same recorder, resampler, and paste path.
 pub(crate) enum Engine {
+    Qwen(crate::local_qwen::Qwen),
     #[cfg(feature = "local-whisper")]
     Whisper(whisper_rs::WhisperState),
     #[cfg(feature = "local-parakeet")]
@@ -15,6 +16,7 @@ impl Engine {
     pub fn load(config: &Config, path: &Path) -> Result<Self> {
         let _ = path;
         match config.local_engine.as_str() {
+            "qwen" => Ok(Self::Qwen(crate::local_qwen::Qwen::load(config, path)?)),
             #[cfg(feature = "local-whisper")]
             "whisper" => {
                 use anyhow::{Context, ensure};
@@ -50,6 +52,13 @@ impl Engine {
     pub fn transcribe(&mut self, config: &Config, samples: &[f32], prompt: &str) -> Result<String> {
         let _ = (config, samples, prompt);
         match self {
+            Self::Qwen(model) => {
+                if !model.is_running() {
+                    *model =
+                        crate::local_qwen::Qwen::load(config, &crate::local::model_path(config))?;
+                }
+                model.transcribe(samples, prompt)
+            }
             #[cfg(feature = "local-whisper")]
             Self::Whisper(state) => {
                 use whisper_rs::{FullParams, SamplingStrategy};
@@ -96,8 +105,6 @@ impl Engine {
                     .map_err(|e| anyhow::anyhow!("Parakeet inference failed: {e}"))?;
                 Ok(result.text.trim().to_owned())
             }
-            #[cfg(not(any(feature = "local-whisper", feature = "local-parakeet")))]
-            _ => bail!("No local speech engines compiled in"),
         }
     }
 }

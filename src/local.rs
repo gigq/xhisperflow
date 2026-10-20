@@ -37,6 +37,10 @@ pub fn model_path(config: &Config) -> PathBuf {
         path
     } else if config.local_engine == "parakeet" {
         data_dir().join("models").join(&config.local_model)
+    } else if config.local_engine == "qwen" {
+        data_dir()
+            .join("models")
+            .join(format!("{}.gguf", config.local_model))
     } else {
         data_dir()
             .join("models")
@@ -47,6 +51,7 @@ pub fn model_path(config: &Config) -> PathBuf {
 pub fn engine_compiled(config: &Config) -> bool {
     (config.local_engine == "whisper" && cfg!(feature = "local-whisper"))
         || (config.local_engine == "parakeet" && cfg!(feature = "local-parakeet"))
+        || config.local_engine == "qwen"
 }
 
 pub fn model_available(config: &Config) -> bool {
@@ -59,12 +64,14 @@ pub fn model_available(config: &Config) -> bool {
             && ["decoder_joint-model.int8.onnx", "decoder_joint-model.onnx"]
                 .iter()
                 .any(|f| path.join(f).is_file())
+    } else if config.local_engine == "qwen" {
+        path.is_file() && crate::local_qwen::helper_path().is_file()
     } else {
         path.is_file()
     }
 }
 
-fn runtime_dir() -> PathBuf {
+pub(crate) fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(|p| PathBuf::from(p).join("xhisperflow"))
         // Keep the macOS socket below sockaddr_un's short path limit.
@@ -89,7 +96,7 @@ fn worker_lock_available() -> bool {
     unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) == 0 }
 }
 
-fn private_dir(path: &Path) -> Result<()> {
+pub(crate) fn private_dir(path: &Path) -> Result<()> {
     use std::os::unix::fs::DirBuilderExt;
     match fs::DirBuilder::new().mode(0o700).create(path) {
         Ok(()) => {}
@@ -106,7 +113,7 @@ fn private_dir(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn read_message(stream: &mut UnixStream) -> Result<Value> {
+pub(crate) fn read_message(stream: &mut UnixStream) -> Result<Value> {
     let mut bytes = Vec::new();
     BufReader::new(stream.take(MAX_MESSAGE + 1)).read_until(b'\n', &mut bytes)?;
     ensure!(
@@ -116,7 +123,7 @@ fn read_message(stream: &mut UnixStream) -> Result<Value> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn send_message(stream: &mut UnixStream, value: &Value) -> Result<()> {
+pub(crate) fn send_message(stream: &mut UnixStream, value: &Value) -> Result<()> {
     let bytes = serde_json::to_vec(value)?;
     ensure!(
         bytes.len() < MAX_MESSAGE as usize,
@@ -256,7 +263,7 @@ fn selected_config(contents: &str, engine: &str, model: &str) -> String {
     result
 }
 
-fn write_config(path: &Path, contents: &str) -> Result<()> {
+pub(crate) fn write_config(path: &Path, contents: &str) -> Result<()> {
     let parent = path.parent().context("Config needs a parent directory")?;
     fs::create_dir_all(parent)?;
     let mut temporary = tempfile::NamedTempFile::new_in(parent)?;
@@ -273,7 +280,8 @@ pub fn select_model(name: &str) -> Result<()> {
         "whisper" | "large-v3-turbo" => ("whisper", "large-v3-turbo"),
         "parakeet" | "parakeet-tdt-0.6b-v3-int8" => ("parakeet", "parakeet-tdt-0.6b-v3-int8"),
         "parakeet-tdt-0.6b-v3" => ("parakeet", "parakeet-tdt-0.6b-v3"),
-        _ => bail!("Choose whisper or parakeet"),
+        "qwen" | "Qwen3-ASR-1.7B-Q8_0" => ("qwen", "Qwen3-ASR-1.7B-Q8_0"),
+        _ => bail!("Choose whisper, parakeet, or qwen"),
     };
     let mut config = Config::load();
     config.local_engine = engine.into();

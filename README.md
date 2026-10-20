@@ -49,7 +49,7 @@ CPU transcription is included by default; `--no-default-features` omits Whisper.
 
 ## Built-in local transcription (Linux and macOS)
 
-The resident worker supports Whisper and Parakeet TDT v3. Whisper can use Vulkan
+The resident worker supports Whisper, Parakeet TDT v3, and Qwen3-ASR 1.7B. Whisper can use Vulkan
 or Metal; Parakeet currently runs on CPU and stays loaded between takes. Both
 are compiled into the default build, including the same worker used by the Mac
 menu bar app. No Voxtype executable or ONNX Runtime system install is needed.
@@ -87,7 +87,78 @@ local-model : "parakeet-tdt-0.6b-v3-int8"
 ```
 
 Use `local-engine : "whisper"` with a Whisper model. `local-threads` controls
-CPU threads for both engines; `local-gpu-device` applies to Whisper only.
+CPU threads; `local-gpu-device` applies to Whisper and Qwen.
+
+To trial Qwen3-ASR locally without cleanup:
+
+```sh
+scripts/setup-local-transcription.sh qwen
+xhisperflow --select-model qwen
+# Return to the previous model:
+xhisperflow --select-model whisper
+```
+
+Qwen uses the [transcribe.cpp runtime](https://github.com/handy-computer/transcribe.cpp)
+and its [Q8_0 conversion of Qwen3-ASR-1.7B](https://huggingface.co/handy-computer/Qwen3-ASR-1.7B-gguf).
+This is an 8-bit conversion of the original Qwen checkpoint, rather than running
+the Transformers `-hf` package directly. The model is 2.19 GB on disk, verified
+by SHA-256. The installer builds a pinned runtime with Vulkan on Linux or Metal
+on Apple Silicon and installs it privately in the app's data directory. It needs
+git, CMake, a C++17 compiler, curl, and Linux Vulkan headers/glslc at setup time;
+there is no Python inference runtime or Voxtype dependency. macOS runtime
+verification is still pending. Qwen uses `local-gpu-device` and `local-threads`,
+accepts `local-language` and the context prompt, and stays loaded between takes.
+Its resident child process isolates its ggml version from Whisper's. Selecting
+another engine releases it. A failed or timed-out response produces an error;
+the next take can restart the helper. No cloud fallback or cleanup is added.
+
+### Optional local LLM cleanup
+
+Qwen, Whisper large-v3-turbo, and Parakeet remain independently selectable.
+Cleanup is a separate option, disabled by default. Install it, then preview a
+piece of text without recording, pasting, or changing the speech model:
+
+```sh
+scripts/setup-local-cleanup.sh
+xhisperflow --cleanup-text 'Um, I would, uh, like to keep Qwen enabled.'
+xhisperflow --cleanup-status
+# Enable for subsequent dictation:
+xhisperflow --local-cleanup on
+# Disable and unload the cleanup model:
+xhisperflow --local-cleanup off
+```
+
+The preview returns JSON with `text`, `accepted`, `reason`, and `elapsed_ms`.
+`accepted` means validation passed; an unchanged proposal may also pass. Rejected
+proposals return the original text. The preview starts the resident cleanup
+worker even when automatic cleanup is off; the `off` command unloads it.
+
+This uses [VoiceInk's Qwen3.5-2B fine-tune](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT)
+at Q4_K_M (1.27 GB on disk) through a pinned, checksum-verified llama.cpp
+runtime. There is no Ollama installation or cloud fallback. Both the app RPC and
+model HTTP traffic use private Unix sockets, with reasoning, web UI, and tools
+disabled. No clipboard or active-window context is collected. Model input and
+output are not written to the cleanup worker log; the existing app transcript
+logging remains as before.
+
+The LLM proposes deletions. The app aligns that proposal to the source and
+rebuilds from original words, retaining technical spelling, case, contractions,
+and numeric formats. Added/substituted/reordered words, lost negations or
+conditions, and uncorrected removals of protected terms/qualifiers are rejected.
+Clear nearby spoken corrections and repeated starts have limited exceptions.
+These checks cannot prove semantic fidelity: this is a conservative experimental
+option, and ambiguous backtracking can remain unchanged. It does not polish
+grammar, guess transcription mistakes, or convert dictated formatting commands.
+
+Automatic cleanup has a default 750 ms deadline (`local-cleanup-timeout-ms`,
+50–3000), and skips input over 3000 UTF-8 bytes. Cold startup, unavailable models,
+errors, timeouts, and invalid edits pass through the original transcript.
+`local-cleanup-enabled : true` selects this local path ahead of the legacy
+cloud cleanup flags; it still respects `post-processing-enabled : false`.
+On this machine, short warmed requests measured roughly 0.08–0.18 seconds,
+with about 1.34 GiB extra VRAM and 0.69 GiB process RSS. Long/ambiguous examples
+can be slower and rejected. Shared Mac code uses Metal; Mac runtime validation
+remains pending.
 
 Download a model once:
 

@@ -44,10 +44,33 @@ pub struct RunOptions {
 }
 
 pub fn run(args: &[String]) -> Result<()> {
+    if args == ["--cleanup-daemon"] {
+        return crate::cleanup::run_daemon(&Config::load());
+    }
+    if args == ["--cleanup-status"] {
+        println!("{}", crate::cleanup::status()?);
+        return Ok(());
+    }
+    if args == ["--stop-cleanup-daemon"] {
+        return crate::cleanup::stop();
+    }
+    if args.first().is_some_and(|a| a == "--cleanup-text") {
+        anyhow::ensure!(args.len() == 2, "usage: xhisperflow --cleanup-text <text>");
+        println!("{}", crate::cleanup::preview(&Config::load(), &args[1])?);
+        return Ok(());
+    }
+    if args.first().is_some_and(|a| a == "--local-cleanup") {
+        anyhow::ensure!(
+            args.len() == 2 && matches!(args[1].as_str(), "on" | "off"),
+            "usage: xhisperflow --local-cleanup on|off"
+        );
+        crate::cleanup::set_enabled(args[1] == "on")?;
+        return Ok(());
+    }
     if args.first().is_some_and(|arg| arg == "--select-model") {
         anyhow::ensure!(
             args.len() == 2,
-            "usage: xhisperflow --select-model whisper|parakeet"
+            "usage: xhisperflow --select-model whisper|parakeet|qwen"
         );
         crate::local::select_model(&args[1])?;
         println!("{}", crate::local::status()?);
@@ -441,6 +464,12 @@ pub(crate) fn use_local(config: &Config) -> bool {
 }
 
 pub(crate) fn prewarm_local(config: &Config) {
+    if config.post_processing_enabled
+        && config.local_cleanup_enabled
+        && let Err(error) = crate::cleanup::start()
+    {
+        eprintln!("Local cleanup warmup failed: {error}");
+    }
     if use_local(config) {
         let config = config.clone();
         thread::spawn(move || {
@@ -453,10 +482,14 @@ pub(crate) fn prewarm_local(config: &Config) {
 
 pub(crate) fn needs_groq(config: &Config) -> bool {
     if use_local(config) {
-        return config.post_processing_enabled && config.local_post_processing_enabled;
+        return config.post_processing_enabled
+            && !config.local_cleanup_enabled
+            && config.local_post_processing_enabled;
     }
     !use_voxtype(config)
-        || (config.post_processing_enabled && config.voxtype_post_processing_enabled)
+        || (config.post_processing_enabled
+            && !config.local_cleanup_enabled
+            && config.voxtype_post_processing_enabled)
 }
 
 fn load_backend_env(config: &Config) {
@@ -469,7 +502,11 @@ pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
     if use_local(config) {
         let start = Instant::now();
         let text = crate::local::transcribe(config, recording)?;
-        log_timed_step("Transcription (built-in Whisper)", &text, start.elapsed())?;
+        log_timed_step(
+            &format!("Transcription (local {})", config.local_engine),
+            &text,
+            start.elapsed(),
+        )?;
         return Ok(text);
     }
     if use_voxtype(config) {
@@ -534,6 +571,12 @@ pub(crate) fn transcribe(config: &Config, recording: &Path) -> Result<String> {
 }
 
 pub(crate) fn post_process(config: &Config, transcript: &str) -> Result<String> {
+    if config.post_processing_enabled && config.local_cleanup_enabled {
+        let started = Instant::now();
+        let cleaned = crate::cleanup::apply(config, transcript);
+        log_timed_step("Cleanup (local VoiceInk)", &cleaned, started.elapsed())?;
+        return Ok(cleaned);
+    }
     if !config.post_processing_enabled
         || (use_local(config) && !config.local_post_processing_enabled)
         || (use_voxtype(config) && !config.voxtype_post_processing_enabled)
@@ -1157,6 +1200,8 @@ mod tests {
         );
         config.local_post_processing_enabled = true;
         assert!(super::needs_groq(&config));
+        config.local_cleanup_enabled = true;
+        assert!(!super::needs_groq(&config));
         config.post_processing_enabled = false;
         assert!(!super::needs_groq(&config));
     }

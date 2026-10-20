@@ -86,6 +86,11 @@ pub fn run() -> Result<()> {
         matches!(
             arg.as_str(),
             "--transcription-daemon"
+                | "--cleanup-daemon"
+                | "--cleanup-status"
+                | "--stop-cleanup-daemon"
+                | "--cleanup-text"
+                | "--local-cleanup"
                 | "--select-model"
                 | "--transcription-status"
                 | "--stop-transcription-daemon"
