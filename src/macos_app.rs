@@ -1,4 +1,4 @@
-use crate::app::{LOG_PATH, load_home_env, log_timed_step, post_process, sleep_secs, transcribe};
+use crate::app::{LOG_PATH, log_timed_step, post_process, sleep_secs, transcribe};
 use crate::config::{Config, config_file_path, home_dir};
 use crate::waveform::{
     HUD_HEIGHT, HUD_WIDTH, LEVEL_HISTORY, SharedLevels, WaveformColor, WaveformMode, WaveformStyle,
@@ -34,7 +34,7 @@ use objc::{class, msg_send, sel, sel_impl};
 use raw_window_handle::{HasWindowHandle, RawWindowHandle};
 use softbuffer::Surface;
 use std::env;
-use std::ffi::{CStr, c_void};
+use std::ffi::c_void;
 use std::fs::{self, File, OpenOptions};
 use std::io::{BufWriter, Write};
 use std::num::NonZeroU32;
@@ -90,7 +90,7 @@ pub fn run() -> Result<()> {
                 | "--cleanup-status"
                 | "--stop-cleanup-daemon"
                 | "--cleanup-text"
-                | "--local-cleanup"
+                | "--cleanup"
                 | "--select-model"
                 | "--transcription-status"
                 | "--stop-transcription-daemon"
@@ -99,7 +99,6 @@ pub fn run() -> Result<()> {
     }) {
         return crate::app::run(&args);
     }
-    load_home_env();
 
     let event_loop = EventLoop::<UserEvent>::with_user_event()
         .build()
@@ -168,7 +167,6 @@ struct MacApp {
     last_hotkey_at: Option<Instant>,
     last_transcription: Option<String>,
     accessibility_prompted: bool,
-    api_key_prompted: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -178,7 +176,6 @@ struct MenuIds {
     copy_last: MenuId,
     login: Option<MenuId>,
     open_config: MenuId,
-    api_key_setup: MenuId,
     show_log: MenuId,
     permissions: MenuId,
     quit: MenuId,
@@ -224,7 +221,7 @@ impl MacHotKey {
 impl MacApp {
     fn new(proxy: EventLoopProxy<UserEvent>) -> Result<Self> {
         let config = Config::load();
-        crate::app::prewarm_local(&config);
+        crate::app::prewarm(&config);
         let hotkey = parse_hotkey_binding(&config.mac_hotkey)?;
         let hotkey_manager =
             GlobalHotKeyManager::new().context("failed to create global hotkey manager")?;
@@ -278,7 +275,6 @@ impl MacApp {
             last_hotkey_at: None,
             last_transcription: None,
             accessibility_prompted: false,
-            api_key_prompted: false,
         })
     }
 
@@ -289,7 +285,6 @@ impl MacApp {
         let copy_last = MenuItem::new("Copy Last Transcription", false, None);
         let status = MenuItem::new("Ready", false, None);
         let open_config = MenuItem::new("Open Config", true, None);
-        let api_key_setup = MenuItem::new("API Key Setup", true, None);
         let show_log = MenuItem::new("Show Log", true, None);
         let login = (!login_agent_enabled()).then(|| MenuItem::new("Start at Login", true, None));
         let permissions = MenuItem::new("Permissions Help", true, None);
@@ -304,7 +299,6 @@ impl MacApp {
             &status,
             &separator,
             &open_config,
-            &api_key_setup,
             &show_log,
         ])
         .context("failed to build tray menu")?;
@@ -321,7 +315,6 @@ impl MacApp {
             copy_last: copy_last.id().clone(),
             login: login.as_ref().map(|item| item.id().clone()),
             open_config: open_config.id().clone(),
-            api_key_setup: api_key_setup.id().clone(),
             show_log: show_log.id().clone(),
             permissions: permissions.id().clone(),
             quit: quit.id().clone(),
@@ -388,8 +381,6 @@ impl MacApp {
             self.copy_last_transcription();
         } else if id == &self.menu_ids.open_config {
             self.open_config();
-        } else if id == &self.menu_ids.api_key_setup {
-            self.open_api_key_setup();
         } else if id == &self.menu_ids.show_log {
             self.open_path(Path::new(LOG_PATH));
         } else if self
@@ -444,7 +435,7 @@ impl MacApp {
         // The CLI model selector updates the shared config while the menu bar
         // app remains running. Snapshot the selected backend for this take.
         self.config = Config::load();
-        crate::app::prewarm_local(&self.config);
+        crate::app::prewarm(&self.config);
         if microphone_restart_required() {
             self.set_status("Restart required");
             show_microphone_restart_prompt();
@@ -455,12 +446,6 @@ impl MacApp {
             self.open_permissions_help();
             return;
         }
-        if crate::app::needs_groq(&self.config) && !groq_api_key_present() {
-            self.set_status("Groq API key required");
-            self.open_api_key_setup();
-            return;
-        }
-
         self.clear_levels();
         match Recorder::start(PathBuf::from(MAC_RECORDING_PATH), self.levels.clone()) {
             Ok(recorder) => {
@@ -571,11 +556,6 @@ impl MacApp {
                 self.state = AppState::Idle;
                 self.set_status(&format!("Transcription failed: {err}"));
                 self.show_hud(true);
-                if crate::app::needs_groq(&self.config)
-                    && (!groq_api_key_present() || err.contains("GROQ_API_KEY"))
-                {
-                    self.open_api_key_setup();
-                }
             }
         }
     }
@@ -701,22 +681,6 @@ impl MacApp {
         }
     }
 
-    fn maybe_prompt_for_api_key(&mut self) {
-        if self.api_key_prompted
-            || !crate::app::needs_groq(&Config::load())
-            || groq_api_key_present()
-            || !required_permissions_granted()
-            || permission_flow_needs_polling()
-            || microphone_restart_required()
-        {
-            return;
-        }
-
-        self.api_key_prompted = true;
-        self.set_status("Groq API key required");
-        self.open_api_key_setup();
-    }
-
     fn ensure_modifier_event_tap_started(&mut self) {
         if self.modifier_tap_started
             || self.modifier_tap_starting
@@ -743,18 +707,11 @@ impl MacApp {
             refresh_permission_buttons();
         }
         self.ensure_modifier_event_tap_started();
-        self.maybe_prompt_for_api_key();
     }
 
     fn open_permissions_help(&self) {
         if catch_unwind(AssertUnwindSafe(show_accessibility_permission_prompt)).is_err() {
             eprintln!("failed to show permissions help");
-        }
-    }
-
-    fn open_api_key_setup(&self) {
-        if catch_unwind(AssertUnwindSafe(show_api_key_setup_prompt)).is_err() {
-            eprintln!("failed to show API key setup");
         }
     }
 
@@ -858,7 +815,6 @@ impl ApplicationHandler<UserEvent> for MacApp {
         }
         self.ensure_modifier_event_tap_started();
         self.maybe_prompt_for_accessibility_permission();
-        self.maybe_prompt_for_api_key();
     }
 
     fn user_event(&mut self, event_loop: &ActiveEventLoop, event: UserEvent) {
@@ -1231,53 +1187,6 @@ fn request_microphone_permission() {
     }
 }
 
-fn groq_api_key_present() -> bool {
-    env::var("GROQ_API_KEY")
-        .ok()
-        .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn save_groq_api_key(api_key: &str) -> Result<()> {
-    let api_key = api_key.trim();
-    if api_key.is_empty() {
-        bail!("API key is empty");
-    }
-    if api_key.bytes().any(|byte| byte == b'\n' || byte == b'\r') {
-        bail!("API key must be a single line");
-    }
-
-    let path = home_dir().join(".env");
-    let existing = fs::read_to_string(&path).unwrap_or_default();
-    let mut lines = Vec::new();
-    let mut replaced = false;
-    for line in existing.lines() {
-        if line
-            .trim_start()
-            .strip_prefix("GROQ_API_KEY")
-            .is_some_and(|rest| rest.trim_start().starts_with('='))
-        {
-            lines.push(format!("GROQ_API_KEY={api_key}"));
-            replaced = true;
-        } else {
-            lines.push(line.to_string());
-        }
-    }
-    if !replaced {
-        if !lines.is_empty() && lines.last().is_some_and(|line| !line.is_empty()) {
-            lines.push(String::new());
-        }
-        lines.push(format!("GROQ_API_KEY={api_key}"));
-    }
-
-    let mut contents = lines.join("\n");
-    contents.push('\n');
-    fs::write(&path, contents).with_context(|| format!("failed to write {}", path.display()))?;
-    unsafe {
-        env::set_var("GROQ_API_KEY", api_key);
-    }
-    Ok(())
-}
-
 #[allow(deprecated)]
 fn show_accessibility_permission_prompt() {
     unsafe {
@@ -1373,73 +1282,6 @@ fn show_accessibility_permission_prompt() {
         let _: id = msg_send![window, retain];
         PERMISSION_SETUP_WINDOW = window;
         let _: () = msg_send![window, makeKeyAndOrderFront: nil];
-    }
-}
-
-#[allow(deprecated)]
-fn show_api_key_setup_prompt() {
-    unsafe {
-        let app: id = msg_send![class!(NSApplication), sharedApplication];
-        let _: () = msg_send![app, activateIgnoringOtherApps: YES];
-
-        if API_KEY_SETUP_WINDOW != nil {
-            let _: () = msg_send![API_KEY_SETUP_WINDOW, makeKeyAndOrderFront: nil];
-            return;
-        }
-
-        let window = make_setup_window(
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(740.0, 360.0)),
-            "Set Up xhisperflow",
-        );
-        let content: id = msg_send![window, contentView];
-        set_view_background(content, ns_color(0.13, 0.13, 0.15, 1.0), 0.0);
-
-        let icon = make_app_icon_view(338.0, 248.0, 64.0, 64.0);
-        let title = make_label("Add your Groq API key", 0.0, 205.0, 740.0, 34.0, 22.0, true);
-        let body = make_label(
-            "Paste your key below. xhisperflow saves it to ~/.env and uses it for transcription.",
-            132.0,
-            166.0,
-            476.0,
-            42.0,
-            13.0,
-            false,
-        );
-        let _: () = msg_send![body, setAlignment: 1_i64];
-
-        let input_box = make_rounded_box(62.0, 82.0, 616.0, 64.0, 14.0);
-        let input_label = make_label("GROQ_API_KEY", 82.0, 116.0, 180.0, 18.0, 11.0, true);
-        let field = make_secure_text_field(82.0, 91.0, 576.0, 24.0);
-        let status = make_label("", 82.0, 55.0, 400.0, 20.0, 11.5, false);
-        let save = make_controller_button(
-            "Save",
-            586.0,
-            50.0,
-            92.0,
-            30.0,
-            sel!(saveApiKeyFromSetupWindow:),
-        );
-
-        API_KEY_FIELD = field;
-        API_KEY_STATUS_LABEL = status;
-        add_subviews(
-            content,
-            &[
-                icon,
-                title,
-                body,
-                input_box,
-                input_label,
-                field,
-                status,
-                save,
-            ],
-        );
-        let _: () = msg_send![window, center];
-        let _: id = msg_send![window, retain];
-        API_KEY_SETUP_WINDOW = window;
-        let _: () = msg_send![window, makeKeyAndOrderFront: nil];
-        let _: () = msg_send![window, makeFirstResponder: field];
     }
 }
 
@@ -1620,25 +1462,6 @@ fn make_controller_button(title: &str, x: f64, y: f64, width: f64, height: f64, 
 }
 
 #[allow(deprecated)]
-fn make_secure_text_field(x: f64, y: f64, width: f64, height: f64) -> id {
-    unsafe {
-        let field: id = msg_send![class!(NSSecureTextField), alloc];
-        let field: id = msg_send![
-            field,
-            initWithFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(width, height))
-        ];
-        let placeholder = NSString::alloc(nil).init_str("gsk_...");
-        let font: id = msg_send![class!(NSFont), systemFontOfSize: 13.0_f64];
-        let _: () = msg_send![field, setPlaceholderString: placeholder];
-        let _: () = msg_send![field, setFont: font];
-        let _: () = msg_send![field, setBezeled: YES];
-        let _: () = msg_send![field, setEditable: YES];
-        let _: () = msg_send![field, setSelectable: YES];
-        field
-    }
-}
-
-#[allow(deprecated)]
 fn set_permission_buttons(accessibility_button: id, microphone_button: id) {
     unsafe {
         ACCESSIBILITY_PERMISSION_BUTTON = accessibility_button;
@@ -1693,9 +1516,6 @@ static mut MICROPHONE_PERMISSION_BUTTON: id = nil;
 static mut PERMISSION_SETUP_WINDOW: id = nil;
 static mut PERMISSION_HELPER_PANEL: id = nil;
 static mut ACTIVE_PERMISSION_HELPER: i32 = PERMISSION_NONE;
-static mut API_KEY_SETUP_WINDOW: id = nil;
-static mut API_KEY_FIELD: id = nil;
-static mut API_KEY_STATUS_LABEL: id = nil;
 static MICROPHONE_REQUEST_FINISHED: AtomicBool = AtomicBool::new(false);
 static MICROPHONE_REQUEST_GRANTED: AtomicBool = AtomicBool::new(false);
 static MICROPHONE_RESTART_REQUIRED: AtomicBool = AtomicBool::new(false);
@@ -1754,10 +1574,6 @@ fn permission_setup_controller_class() -> *const Class {
                     refresh_permission_buttons_from_timer as extern "C" fn(&Object, Sel, id),
                 );
                 decl.add_method(
-                    sel!(saveApiKeyFromSetupWindow:),
-                    save_api_key_from_setup_window as extern "C" fn(&Object, Sel, id),
-                );
-                decl.add_method(
                     sel!(restartXhisperflow:),
                     restart_xhisperflow_from_helper as extern "C" fn(&Object, Sel, id),
                 );
@@ -1796,59 +1612,12 @@ extern "C" fn refresh_permission_buttons_from_timer(_: &Object, _: Sel, _: id) {
     refresh_permission_buttons();
 }
 
-extern "C" fn save_api_key_from_setup_window(_: &Object, _: Sel, _: id) {
-    unsafe {
-        if API_KEY_FIELD == nil {
-            return;
-        }
-
-        let value: id = msg_send![API_KEY_FIELD, stringValue];
-        match save_groq_api_key(&nsstring_to_string(value)) {
-            Ok(()) => {
-                if API_KEY_SETUP_WINDOW != nil {
-                    let _: () = msg_send![API_KEY_SETUP_WINDOW, close];
-                    API_KEY_SETUP_WINDOW = nil;
-                }
-                API_KEY_FIELD = nil;
-                API_KEY_STATUS_LABEL = nil;
-            }
-            Err(err) => set_api_key_status(&format!("{err:#}")),
-        }
-    }
-}
-
 extern "C" fn restart_xhisperflow_from_helper(_: &Object, _: Sel, _: id) {
     unsafe {
         MICROPHONE_RESTART_REQUIRED.store(true, Ordering::SeqCst);
         relaunch_current_app();
         let app: id = msg_send![class!(NSApplication), sharedApplication];
         let _: () = msg_send![app, terminate: nil];
-    }
-}
-
-fn nsstring_to_string(value: id) -> String {
-    unsafe {
-        if value == nil {
-            return String::new();
-        }
-        let bytes: *const std::os::raw::c_char = msg_send![value, UTF8String];
-        if bytes.is_null() {
-            return String::new();
-        }
-        CStr::from_ptr(bytes).to_string_lossy().into_owned()
-    }
-}
-
-#[allow(deprecated)]
-fn set_api_key_status(message: &str) {
-    unsafe {
-        if API_KEY_STATUS_LABEL == nil {
-            return;
-        }
-        let message = NSString::alloc(nil).init_str(message);
-        let _: () = msg_send![API_KEY_STATUS_LABEL, setStringValue: message];
-        let red: id = msg_send![class!(NSColor), systemRedColor];
-        let _: () = msg_send![API_KEY_STATUS_LABEL, setTextColor: red];
     }
 }
 

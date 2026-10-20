@@ -42,4 +42,4 @@ if [[ ! -f "$model" ]] || [[ "$(digest "$model")" != "$model_sha" ]]; then
   mv "$temporary/model.gguf" "$model"
 fi
 printf 'Local cleanup installed, still disabled. Preview: xhisperflow --cleanup-text "Um, keep Qwen enabled."\n'
-printf 'Enable: xhisperflow --local-cleanup on\nDisable and unload: xhisperflow --local-cleanup off\n'
+printf 'Enable: xhisperflow --cleanup on\nDisable and unload: xhisperflow --cleanup off\n'

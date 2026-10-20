@@ -63,5 +63,5 @@ if [[ ! -s "$destination" ]]; then
   trap - EXIT
 fi
 printf 'Installed model: %s\n' "$destination"
-printf 'Select local-engine : "whisper" and local-model : "%s" in xhisperflowrc.\n' "$model"
+printf 'Select engine : "whisper" and model : "%s" in xhisperflowrc.\n' "$model"
 printf 'The app starts its resident worker automatically. Restart the worker after changing its model.\n'

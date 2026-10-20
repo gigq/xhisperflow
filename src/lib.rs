@@ -6,7 +6,6 @@ pub mod local;
 mod local_engine;
 mod local_qwen;
 mod paste;
-mod voxtype;
 pub mod waveform;
 
 #[cfg(target_os = "linux")]

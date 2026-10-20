@@ -20,19 +20,25 @@ fn run_with_cleanup(response: Value, cleanup: Option<Option<Value>>) -> std::pro
         dir.path().join("xhisperflow")
     };
     fs::create_dir_all(&config).unwrap();
-    fs::write(config.join("xhisperflowrc"), "transcription-backend : local\nlocal-model : /model.bin\nlocal-post-processing-enabled : false\n").unwrap();
+    fs::write(config.join("xhisperflowrc"), "model : /model.bin\n").unwrap();
     let cleanup_worker = cleanup.map(|response| {
         let listener = UnixListener::bind(runtime.join("xhisperflow/cleanup.sock")).unwrap();
-        fs::write(config.join("xhisperflowrc"), "transcription-backend : local\nlocal-model : /model.bin\nlocal-post-processing-enabled : true\nlocal-cleanup-enabled : true\nlocal-cleanup-timeout-ms : 50\n").unwrap();
+        fs::write(
+            config.join("xhisperflowrc"),
+            "model : /model.bin\ncleanup-enabled : true\ncleanup-timeout-ms : 50\n",
+        )
+        .unwrap();
         std::thread::spawn(move || {
-            let (mut socket,_) = listener.accept().unwrap();
+            let (mut socket, _) = listener.accept().unwrap();
             let mut request = String::new();
             BufReader::new(&socket).read_line(&mut request).unwrap();
             let request: Value = serde_json::from_str(&request).unwrap();
             assert_eq!(request["text"], "Um, keep Qwen enabled.");
             if let Some(response) = response {
                 writeln!(socket, "{response}").unwrap();
-            } else { std::thread::sleep(std::time::Duration::from_millis(150)); }
+            } else {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+            }
         })
     });
     let wav = dir.path().join("recording with spaces.wav");
@@ -54,9 +60,8 @@ fn run_with_cleanup(response: Value, cleanup: Option<Option<Value>>) -> std::pro
         .env_remove("XDG_DATA_HOME")
         .env("XDG_CONFIG_HOME", dir.path())
         .env("XDG_RUNTIME_DIR", runtime)
-        // No Voxtype executable and no cloud credentials are available.
+        // No external commands or model assets are available in this fixture.
         .env("PATH", dir.path())
-        .env("GROQ_API_KEY", "")
         .output()
         .unwrap();
     worker.join().unwrap();
@@ -67,7 +72,7 @@ fn run_with_cleanup(response: Value, cleanup: Option<Option<Value>>) -> std::pro
 }
 
 #[test]
-fn optional_local_cleanup_runs_without_cloud_credentials() {
+fn optional_cleanup_uses_the_resident_worker() {
     let output = run_with_cleanup(
         json!({"text":"Um, keep Qwen enabled."}),
         Some(Some(json!({"text":"keep Qwen enabled.","accepted":true}))),
@@ -81,7 +86,7 @@ fn optional_local_cleanup_runs_without_cloud_credentials() {
 }
 
 #[test]
-fn local_cleanup_failure_and_timeout_preserve_the_original_without_cloud_fallback() {
+fn cleanup_failure_and_timeout_preserve_the_original() {
     for response in [Some(json!({"error":"model unavailable"})), None] {
         let output = run_with_cleanup(json!({"text":"Um, keep Qwen enabled."}), Some(response));
         assert!(
@@ -94,7 +99,7 @@ fn local_cleanup_failure_and_timeout_preserve_the_original_without_cloud_fallbac
 }
 
 #[test]
-fn reuses_resident_worker_without_voxtype_or_api_key() {
+fn reuses_builtin_resident_worker() {
     let output = run(json!({"text":"Resident model transcript."}));
     assert!(
         output.status.success(),
@@ -114,4 +119,35 @@ fn local_worker_errors_and_invalid_responses_never_become_dictated_text() {
         assert!(!output.status.success());
         assert!(output.stdout.is_empty());
     }
+}
+
+#[test]
+fn missing_model_reports_installation_error_instead_of_selecting_another_backend() {
+    let dir = tempfile::tempdir_in("/tmp").unwrap();
+    let config = if cfg!(target_os = "macos") {
+        dir.path().join("Library/Application Support/xhisperflow")
+    } else {
+        dir.path().join("xhisperflow")
+    };
+    fs::create_dir_all(&config).unwrap();
+    fs::write(config.join("xhisperflowrc"), "model : /missing-model.bin\n").unwrap();
+    let wav = dir.path().join("recording.wav");
+    fs::write(&wav, "fixture").unwrap();
+    let output = Command::new(env!("CARGO_BIN_EXE_xhisperflow"))
+        .arg("--transcribe-file")
+        .arg(&wav)
+        .env("HOME", dir.path())
+        .env("XDG_CONFIG_HOME", dir.path())
+        .env("XDG_RUNTIME_DIR", dir.path())
+        .env("PATH", dir.path())
+        .env_remove("XDG_DATA_HOME")
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(output.stdout.is_empty());
+    let error = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        error.contains("model not found") || error.contains("local-whisper"),
+        "{error}"
+    );
 }

@@ -32,31 +32,31 @@ pub fn data_dir() -> PathBuf {
 }
 
 pub fn model_path(config: &Config) -> PathBuf {
-    let path = PathBuf::from(&config.local_model);
+    let path = PathBuf::from(&config.model);
     if path.is_absolute() {
         path
-    } else if config.local_engine == "parakeet" {
-        data_dir().join("models").join(&config.local_model)
-    } else if config.local_engine == "qwen" {
+    } else if config.engine == "parakeet" {
+        data_dir().join("models").join(&config.model)
+    } else if config.engine == "qwen" {
         data_dir()
             .join("models")
-            .join(format!("{}.gguf", config.local_model))
+            .join(format!("{}.gguf", config.model))
     } else {
         data_dir()
             .join("models")
-            .join(format!("ggml-{}.bin", config.local_model))
+            .join(format!("ggml-{}.bin", config.model))
     }
 }
 
 pub fn engine_compiled(config: &Config) -> bool {
-    (config.local_engine == "whisper" && cfg!(feature = "local-whisper"))
-        || (config.local_engine == "parakeet" && cfg!(feature = "local-parakeet"))
-        || config.local_engine == "qwen"
+    (config.engine == "whisper" && cfg!(feature = "local-whisper"))
+        || (config.engine == "parakeet" && cfg!(feature = "local-parakeet"))
+        || config.engine == "qwen"
 }
 
 pub fn model_available(config: &Config) -> bool {
     let path = model_path(config);
-    if config.local_engine == "parakeet" {
+    if config.engine == "parakeet" {
         path.join("vocab.txt").is_file()
             && ["encoder-model.int8.onnx", "encoder-model.onnx"]
                 .iter()
@@ -64,7 +64,7 @@ pub fn model_available(config: &Config) -> bool {
             && ["decoder_joint-model.int8.onnx", "decoder_joint-model.onnx"]
                 .iter()
                 .any(|f| path.join(f).is_file())
-    } else if config.local_engine == "qwen" {
+    } else if config.engine == "qwen" {
         path.is_file() && crate::local_qwen::helper_path().is_file()
     } else {
         path.is_file()
@@ -143,7 +143,7 @@ fn connect(timeout: Duration) -> Result<UnixStream> {
 }
 
 pub fn ensure_running(config: &Config) -> Result<UnixStream> {
-    let timeout = Duration::from_secs(config.local_timeout_secs);
+    let timeout = Duration::from_secs(config.transcription_timeout_secs);
     match connect(timeout) {
         Ok(stream) => return Ok(stream),
         Err(err)
@@ -158,7 +158,7 @@ pub fn ensure_running(config: &Config) -> Result<UnixStream> {
     ensure!(
         engine_compiled(config),
         "Rebuild xhisperflow with the local-{} feature",
-        config.local_engine
+        config.engine
     );
     ensure!(
         model_available(config),
@@ -210,7 +210,7 @@ pub fn transcribe(config: &Config, recording: &Path) -> Result<String> {
     let mut stream = ensure_running(config)?;
     send_message(
         &mut stream,
-        &json!({"file": path, "engine": config.local_engine, "model": model_path(config), "language": config.local_language,
+        &json!({"file": path, "engine": config.engine, "model": model_path(config), "language": config.language,
         "prompt": config.transcription_prompt}),
     )?;
     transcript_response(read_message(&mut stream)?)
@@ -253,13 +253,13 @@ fn selected_config(contents: &str, engine: &str, model: &str) -> String {
             !line.split_once(':').is_some_and(|(key, _)| {
                 matches!(
                     key.trim(),
-                    "transcription-backend" | "local-engine" | "local-model"
+                    "engine" | "model" | "local-engine" | "local-model" | "transcription-backend"
                 )
             })
         })
         .collect::<Vec<_>>()
         .join("\n");
-    result.push_str(&format!("\ntranscription-backend : \"local\"\nlocal-engine : \"{engine}\"\nlocal-model : \"{model}\"\n"));
+    result.push_str(&format!("\nengine : \"{engine}\"\nmodel : \"{model}\"\n"));
     result
 }
 
@@ -284,8 +284,8 @@ pub fn select_model(name: &str) -> Result<()> {
         _ => bail!("Choose whisper, parakeet, or qwen"),
     };
     let mut config = Config::load();
-    config.local_engine = engine.into();
-    config.local_model = model.into();
+    config.engine = engine.into();
+    config.model = model.into();
     ensure!(
         engine_compiled(&config),
         "This build does not include local-{engine}"
@@ -340,7 +340,7 @@ pub fn select_model(name: &str) -> Result<()> {
             drop(ensure_running(&config)?);
         }
         let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(config.local_timeout_secs) {
+        while start.elapsed() < Duration::from_secs(config.transcription_timeout_secs) {
             if let Ok(ready) = status() {
                 ensure!(
                     ready
@@ -405,7 +405,7 @@ pub fn run_daemon(config: &Config) -> Result<()> {
     fs::set_permissions(&socket, fs::Permissions::from_mode(0o600))?;
     eprintln!(
         "Local {} ready: model={}, pid={}, loaded in {:.3}s",
-        config.local_engine,
+        config.engine,
         path.display(),
         std::process::id(),
         started.elapsed().as_secs_f64()
@@ -426,7 +426,7 @@ pub fn run_daemon(config: &Config) -> Result<()> {
         if request.get("status").and_then(Value::as_bool) == Some(true) {
             let _ = send_message(
                 &mut stream,
-                &json!({"ready":true, "engine":config.local_engine, "model":path, "pid":std::process::id(), "language":config.local_language}),
+                &json!({"ready":true, "engine":config.engine, "model":path, "pid":std::process::id(), "language":config.language}),
             );
             continue;
         }
@@ -438,8 +438,8 @@ pub fn run_daemon(config: &Config) -> Result<()> {
                         .get("engine")
                         .and_then(Value::as_str)
                         .unwrap_or("whisper")
-                        == config.local_engine
-                    && request.get("language") == Some(&json!(config.local_language)),
+                        == config.engine
+                    && request.get("language") == Some(&json!(config.language)),
                 "Worker engine/model/language differs from config; restart the transcription worker"
             );
             let file = request
@@ -535,21 +535,22 @@ mod tests {
 
     #[test]
     fn selector_preserves_unrelated_settings_and_removes_duplicate_overrides() {
-        let original = "# my dictation\nlocal-model : old\noutput-method : paste\nlocal-model : duplicate\nlocal-engine : whisper\ntranscription-backend : auto\n";
+        let original = "# my dictation\nmodel : old\noutput-method : paste\nlocal-model : duplicate\nengine : whisper\ntranscription-backend : auto\n";
         let updated = selected_config(original, "parakeet", "parakeet-tdt-0.6b-v3-int8");
         assert!(updated.contains("# my dictation\noutput-method : paste"));
-        assert_eq!(updated.matches("local-model :").count(), 1);
-        assert_eq!(updated.matches("local-engine :").count(), 1);
-        assert!(updated.contains("local-engine : \"parakeet\""));
-        assert!(updated.contains("transcription-backend : \"local\""));
+        assert_eq!(updated.matches("model :").count(), 1);
+        assert_eq!(updated.matches("engine :").count(), 1);
+        assert!(!updated.contains("local-model"));
+        assert!(updated.contains("engine : \"parakeet\""));
+        assert!(!updated.contains("transcription-backend"));
     }
 
     #[test]
     fn parakeet_requires_both_networks_and_vocabulary() {
         let dir = tempfile::tempdir().unwrap();
         let config = Config {
-            local_engine: "parakeet".into(),
-            local_model: dir.path().to_str().unwrap().into(),
+            engine: "parakeet".into(),
+            model: dir.path().to_str().unwrap().into(),
             ..Default::default()
         };
         assert!(!model_available(&config));

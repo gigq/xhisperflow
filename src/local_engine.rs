@@ -15,19 +15,19 @@ pub(crate) enum Engine {
 impl Engine {
     pub fn load(config: &Config, path: &Path) -> Result<Self> {
         let _ = path;
-        match config.local_engine.as_str() {
+        match config.engine.as_str() {
             "qwen" => Ok(Self::Qwen(crate::local_qwen::Qwen::load(config, path)?)),
             #[cfg(feature = "local-whisper")]
             "whisper" => {
                 use anyhow::{Context, ensure};
                 use whisper_rs::{WhisperContext, WhisperContextParameters};
                 ensure!(
-                    config.local_language == "auto"
-                        || whisper_rs::get_lang_id(&config.local_language).is_some(),
+                    config.language == "auto"
+                        || whisper_rs::get_lang_id(&config.language).is_some(),
                     "Unknown local-language"
                 );
                 let mut params = WhisperContextParameters::default();
-                params.use_gpu(true).gpu_device(config.local_gpu_device);
+                params.use_gpu(true).gpu_device(config.gpu_device);
                 let context = WhisperContext::new_with_params(
                     path.to_str().context("Invalid model path")?,
                     params,
@@ -38,7 +38,7 @@ impl Engine {
             #[cfg(feature = "local-parakeet")]
             "parakeet" => {
                 let execution = parakeet_rs::ExecutionConfig::default()
-                    .with_intra_threads(config.local_threads as usize);
+                    .with_intra_threads(config.threads as usize);
                 let model = parakeet_rs::ParakeetTDT::from_pretrained(path, Some(execution))
                     .map_err(|e| anyhow::anyhow!("Parakeet model load failed: {e}"))?;
                 Ok(Self::Parakeet(Box::new(model)))
@@ -63,11 +63,11 @@ impl Engine {
             Self::Whisper(state) => {
                 use whisper_rs::{FullParams, SamplingStrategy};
                 let mut params = FullParams::new(SamplingStrategy::Greedy { best_of: 1 });
-                params.set_n_threads(config.local_threads);
-                params.set_language(if config.local_language == "auto" {
+                params.set_n_threads(config.threads);
+                params.set_language(if config.language == "auto" {
                     None
                 } else {
-                    Some(&config.local_language)
+                    Some(&config.language)
                 });
                 params.set_translate(false);
                 params.set_no_context(true);

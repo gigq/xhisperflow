@@ -1,42 +1,34 @@
-# xhisperflow configuration
-# Copy to ~/.config/xhisperflow/xhisperflowrc and customize
-# When in doubt, check by running 'xhisperflow --log'
+# xhisperflow configuration (all inference runs on this machine)
+# Linux: ~/.config/xhisperflow/xhisperflowrc
+# macOS: ~/Library/Application Support/xhisperflow/xhisperflowrc
+# Inspect raw/final text and timings with: xhisperflow --log
 
-# Transcription Settings:
-# Auto prefers the built-in worker when its model is installed, then Voxtype
-# on Linux, otherwise Groq. Set local, groq, or voxtype explicitly if desired.
-transcription-backend   : "auto"
-# Run scripts/setup-local-transcription.sh to install the built-in model.
-local-engine            : "whisper" # or parakeet; --select-model handles both settings
-local-model             : "large-v3-turbo" # model name or absolute .bin path
-local-language          : "en" # or auto
-local-threads           : 4
-local-gpu-device        : 0
-local-timeout           : 120
-local-post-processing-enabled : false # optional Groq cleanup; off by default
-# Voxtype uses its own model/config; optional Groq cleanup is off for local speech.
-voxtype-post-processing-enabled : false
-voxtype-timeout         : 120
-long-recording-threshold : 1000
-transcription-prompt     : ""
-post-processing-enabled  : true
-post-processing-model    : "openai/gpt-oss-20b"
-post-processing-timeout  : 3
-# Linux Wayland: use "paste" for a single fast clipboard paste (wl-copy + wtype).
-# "type" keeps simulated typing; "clipboard" keeps the legacy helper path.
-output-method            : "type"
-paste-keys               : "ctrl+v" # also ctrl+shift+v or shift+insert
-clipboard-restore-delay  : 0.15
+# Speech recognition: install weights with scripts/setup-local-transcription.sh
+# --select-model whisper|parakeet|qwen updates both engine and model.
+engine                : "whisper"
+model                 : "large-v3-turbo" # name or absolute model path
+language              : "en" # or auto
+threads               : 4
+gpu-device            : 0
+transcription-timeout : 120 # seconds
+transcription-prompt  : ""
 
-# Paste Timing (seconds):
-non-ascii-initial-delay : 0.15 # Increase this if first character comes out wrong.
-non-ascii-default-delay : 0.025
+# Optional resident VoiceInk cleanup: scripts/setup-local-cleanup.sh
+cleanup-enabled       : false
+cleanup-timeout-ms    : 750
 
-# Waveform HUD (macOS and Linux):
+# Linux insertion: paste (wl-copy + wtype), type, or clipboard (uinput helper).
+output-method           : "type"
+paste-keys              : "ctrl+v" # also ctrl+shift+v or shift+insert
+clipboard-restore-delay : 0.15
+non-ascii-initial-delay  : 0.15
+non-ascii-default-delay  : 0.025
+
+# Waveform HUD (macOS and Linux)
 floating-waveform       : true
 waveform-gradient-start : "#b58cff"
 waveform-gradient-end   : "#d7e6ff"
 
-# macOS App:
+# macOS hotkeys; cancel-hotkey may be empty to disable it.
 hotkey        : "alt+space"
 cancel-hotkey : "ctrl+shift"

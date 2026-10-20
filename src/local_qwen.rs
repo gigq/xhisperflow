@@ -33,9 +33,9 @@ impl Qwen {
     pub fn load(config: &Config, model: &Path) -> Result<Self> {
         let mut child = Command::new(helper_path())
             .arg(model)
-            .arg(&config.local_language)
-            .arg(config.local_threads.to_string())
-            .arg(config.local_gpu_device.to_string())
+            .arg(&config.language)
+            .arg(config.threads.to_string())
+            .arg(config.gpu_device.to_string())
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -47,7 +47,7 @@ impl Qwen {
             child,
             input,
             output,
-            timeout: Duration::from_secs(config.local_timeout_secs),
+            timeout: Duration::from_secs(config.transcription_timeout_secs),
         };
         ensure!(this.response()? == "ready", "Invalid Qwen startup response");
         Ok(this)

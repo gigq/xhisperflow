@@ -38,7 +38,7 @@ fn paste_with(copy: &Path, keyboard: &Path, text: &str, keys: &str) -> Result<()
         bail!("wl-copy failed ({status}); no paste shortcut was sent");
     }
     // A short device-initialization pause, then one paste, regardless of text size.
-    // Like Voxtype's default paste mode, leave the transcript on the clipboard;
+    // Leave the transcript on the clipboard;
     // early restoration can race an application's asynchronous clipboard read.
     let status = Command::new(keyboard)
         .args(["-s", "100"])

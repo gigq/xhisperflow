@@ -102,8 +102,8 @@ pub fn preview(config: &Config, text: &str) -> Result<Value> {
     );
     ready()?;
     request(
-        &json!({"text":text,"timeout_ms":config.local_cleanup_timeout_ms}),
-        Duration::from_millis(config.local_cleanup_timeout_ms + 100),
+        &json!({"text":text,"timeout_ms":config.cleanup_timeout_ms}),
+        Duration::from_millis(config.cleanup_timeout_ms + 100),
     )
 }
 
@@ -114,8 +114,8 @@ pub fn apply(config: &Config, text: &str) -> String {
         return text.to_owned();
     }
     let response = request(
-        &json!({"text":text,"timeout_ms":config.local_cleanup_timeout_ms}),
-        Duration::from_millis(config.local_cleanup_timeout_ms),
+        &json!({"text":text,"timeout_ms":config.cleanup_timeout_ms}),
+        Duration::from_millis(config.cleanup_timeout_ms),
     );
     match response {
         Ok(value) => value["text"].as_str().unwrap_or(text).to_owned(),
@@ -139,15 +139,15 @@ pub fn set_enabled(enabled: bool) -> Result<()> {
     let mut lines: Vec<_> = source
         .lines()
         .filter(|line| {
-            !line
-                .split_once(':')
-                .is_some_and(|(key, _)| key.trim() == "local-cleanup-enabled")
+            !line.split_once(':').is_some_and(|(key, _)| {
+                matches!(key.trim(), "cleanup-enabled" | "local-cleanup-enabled")
+            })
         })
         .collect();
     lines.push(if enabled {
-        "local-cleanup-enabled : true"
+        "cleanup-enabled : true"
     } else {
-        "local-cleanup-enabled : false"
+        "cleanup-enabled : false"
     });
     local::write_config(&path, &(lines.join("\n") + "\n"))?;
     if !enabled {
@@ -253,7 +253,7 @@ pub fn run_daemon(config: &Config) -> Result<()> {
             } else {
                 "Vulkan"
             },
-            config.local_gpu_device
+            config.gpu_device
         ))
         .stdin(Stdio::null())
         .stdout(Stdio::null())
