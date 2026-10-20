@@ -42,7 +42,7 @@ impl Default for Config {
             gpu_device: 0,
             transcription_timeout_secs: 120,
             cleanup_enabled: false,
-            cleanup_timeout_ms: 750,
+            cleanup_timeout_ms: 3000,
             transcription_prompt: String::new(),
             output_method: OutputMethod::Type,
             paste_keys: "ctrl+v".to_string(),
@@ -249,7 +249,7 @@ mod tests {
         assert_eq!(invalid.threads, 4);
         assert_eq!(invalid.transcription_timeout_secs, 120);
         assert_eq!(invalid.gpu_device, 0);
-        assert_eq!(invalid.cleanup_timeout_ms, 750);
+        assert_eq!(invalid.cleanup_timeout_ms, 3000);
     }
 
     #[test]

@@ -17,7 +17,82 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 const PROMPT: &str = include_str!("../prompts/local-cleanup.txt");
-const MAX_INPUT: usize = 3000;
+const MAX_INPUT: usize = 16000;
+
+// Each generation has short context; an unsafe edit cannot discard successful
+// cleanup elsewhere in a long dictation. Slices retain all input whitespace.
+fn passages(text: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let (mut start, mut position, mut words) = (0, 0, 0);
+    for token in text.split_inclusive(char::is_whitespace) {
+        position += token.len();
+        if !token.trim().is_empty() {
+            words += 1;
+        }
+        let sentence_end = token.trim_end().ends_with(['.', '!', '?']);
+        if (sentence_end && words >= 30) || words >= 90 || position - start >= 900 {
+            chunks.push(&text[start..position]);
+            start = position;
+            words = 0;
+        }
+    }
+    if start < text.len() {
+        chunks.push(&text[start..]);
+    }
+    chunks
+}
+
+fn clean_passages(
+    text: &str,
+    timeout: Duration,
+    mut generate_part: impl FnMut(&str, Duration) -> Result<String>,
+) -> Value {
+    let started = Instant::now();
+    let deadline = started + timeout.saturating_sub(Duration::from_millis(75));
+    let mut output = String::new();
+    let (mut changed, mut rejected) = (0, 0);
+    let mut timed_out = false;
+    let mut reason = String::new();
+    let chunks = passages(text);
+    for chunk in &chunks {
+        let leading = chunk.len() - chunk.trim_start().len();
+        let core = chunk.trim();
+        if core.is_empty() {
+            output.push_str(chunk);
+            continue;
+        }
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        let no_time_left = remaining < Duration::from_millis(25);
+        let result = if no_time_left {
+            Err(anyhow::anyhow!("Cleanup reached its total deadline"))
+        } else {
+            generate_part(core, remaining)
+                .and_then(|proposal| crate::cleanup_guard::validate(core, &proposal))
+        };
+        match result {
+            Ok(cleaned) => {
+                changed += usize::from(cleaned != core);
+                output.push_str(&chunk[..leading]);
+                output.push_str(&cleaned);
+                output.push_str(&chunk[leading + core.len()..]);
+            }
+            Err(error) => {
+                rejected += 1;
+                timed_out |= no_time_left
+                    || error
+                        .downcast_ref::<reqwest::Error>()
+                        .is_some_and(reqwest::Error::is_timeout);
+                if reason.is_empty() {
+                    reason = error.to_string();
+                }
+                output.push_str(chunk);
+            }
+        }
+    }
+    json!({"text":output,"accepted":rejected == 0,"partial":rejected > 0 && changed > 0,
+        "parts":chunks.len(),"changed_parts":changed,"rejected_parts":rejected,
+        "timed_out":timed_out,"reason":reason,"elapsed_ms":started.elapsed().as_millis()})
+}
 
 fn control_socket() -> PathBuf {
     local::runtime_dir().join("cleanup.sock")
@@ -92,7 +167,7 @@ pub fn status() -> Result<Value> {
     request(&json!({"status":true}), Duration::from_millis(200))
 }
 pub fn stop() -> Result<()> {
-    request(&json!({"stop":true}), Duration::from_secs(2)).map(|_| ())
+    request(&json!({"stop":true}), Duration::from_secs(4)).map(|_| ())
 }
 
 pub fn preview(config: &Config, text: &str) -> Result<Value> {
@@ -115,7 +190,7 @@ pub fn apply(config: &Config, text: &str) -> String {
     }
     let response = request(
         &json!({"text":text,"timeout_ms":config.cleanup_timeout_ms}),
-        Duration::from_millis(config.cleanup_timeout_ms),
+        Duration::from_millis(config.cleanup_timeout_ms + 100),
     );
     match response {
         Ok(value) => value["text"].as_str().unwrap_or(text).to_owned(),
@@ -334,25 +409,100 @@ pub fn run_daemon(config: &Config) -> Result<()> {
         let timeout = Duration::from_millis(
             request["timeout_ms"]
                 .as_u64()
-                .unwrap_or(750)
+                .unwrap_or(3000)
                 .clamp(50, 3000),
         );
-        let started = Instant::now();
-        let result =
-            generate(&client, text, timeout).and_then(|p| crate::cleanup_guard::validate(text, &p));
-        let (output, accepted, reason) = match result {
-            Ok(value) => (value, true, String::new()),
-            Err(error) => (text.to_owned(), false, error.to_string()),
-        };
-        let response = json!({"text":output,"accepted":accepted,"reason":reason,"elapsed_ms":started.elapsed().as_millis()});
+        let response = clean_passages(text, timeout, |part, remaining| {
+            generate(&client, part, remaining)
+        });
         let _ = local::send_message(&mut stream, &response);
         // Do not log dictation or model responses.
         eprintln!(
-            "Local cleanup completed: {}ms, accepted={accepted}",
-            started.elapsed().as_millis()
+            "Local cleanup completed: {}ms, changed={}, rejected={}, timed_out={}",
+            response["elapsed_ms"],
+            response["changed_parts"],
+            response["rejected_parts"],
+            response["timed_out"]
         );
     }
     let _ = fs::remove_file(control_socket());
     let _ = fs::remove_file(llm_socket());
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn passages_preserve_unicode_whitespace_and_bound_unpunctuated_input() {
+        let text = format!(
+            "  {}\n\n{}\n",
+            "Um, keep SQLiteData and 東京 unchanged. ".repeat(12),
+            "word ".repeat(200)
+        );
+        let parts = passages(&text);
+        assert_eq!(parts.concat(), text);
+        assert!(parts.len() > 2);
+        assert!(parts.iter().all(|p| p.split_whitespace().count() <= 90));
+    }
+
+    #[test]
+    fn rejected_edits_do_not_erase_cleanup_in_other_passages() {
+        let first = "Um, keep Qwen enabled. ".repeat(8);
+        let second = "Do not delete the database. ".repeat(6);
+        let text = format!("{first}{second}");
+        let result = clean_passages(&text, Duration::from_secs(3), |part, _| {
+            if part.contains("database") {
+                Ok("Delete the database.".into())
+            } else {
+                Ok(part.replace("Um, ", ""))
+            }
+        });
+        assert_eq!(result["partial"], true);
+        assert!(result["changed_parts"].as_u64().unwrap() > 0);
+        assert!(result["rejected_parts"].as_u64().unwrap() > 0);
+        let output = result["text"].as_str().unwrap();
+        assert!(output.starts_with("Keep Qwen enabled."));
+        assert!(output.contains("Do not delete the database."));
+    }
+
+    #[test]
+    fn one_deadline_covers_all_passages_and_preserves_unprocessed_text() {
+        let text = "keep every word in this sentence exactly as it is because this is a test of preserving the complete original text under a total time budget that applies across all of its separate passages. ".repeat(4);
+        let mut calls = 0;
+        let result = clean_passages(&text, Duration::from_millis(200), |part, remaining| {
+            calls += 1;
+            assert!(remaining <= Duration::from_millis(125));
+            std::thread::sleep(Duration::from_millis(105));
+            Ok(part.into())
+        });
+        assert_eq!(calls, 1);
+        assert_eq!(result["text"], text);
+        assert_eq!(result["timed_out"], true);
+        assert!(result["rejected_parts"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn full_rambling_message_keeps_safe_cleanup_after_an_unsafe_opening_edit() {
+        let text = include_str!("../tests/fixtures/rambling-dictation.txt").trim();
+        let result = clean_passages(text, Duration::from_secs(3), |part, _| {
+            if part.starts_with("Okay,") {
+                Ok("We should remove the remote LLM stuff.".into())
+            } else {
+                Ok(part
+                    .replace(", you know,", "")
+                    .replace("you know ", "")
+                    .replace("let's let's", "let's"))
+            }
+        });
+        let output = result["text"].as_str().unwrap();
+        assert!(output.starts_with("Okay, so I do think I don't know."));
+        assert!(!output.contains("you know"));
+        assert!(!output.contains("let's let's"));
+        assert!(output.contains("remote LLVM"));
+        assert!(output.contains("I know you had a flag"));
+        assert!(output.contains("then I think that's fine."));
+        assert_eq!(result["partial"], true);
+    }
 }

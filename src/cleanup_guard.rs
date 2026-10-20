@@ -86,6 +86,7 @@ fn protected(word: &str) -> bool {
             | "only"
             | "except"
             | "think"
+            | "know"
             | "believe"
             | "might"
             | "may"
@@ -150,18 +151,25 @@ pub fn validate(original: &str, proposal: &str) -> Result<String> {
         .enumerate()
         .flat_map(|(i, word)| normalized(word.text).into_iter().map(move |key| (i, key)))
         .collect();
-    let wanted: Vec<_> = target.iter().flat_map(|w| normalized(w.text)).collect();
     let mut counts = vec![0_usize; source.len()];
+    let mut alignment = Vec::new();
     let mut cursor = 0;
-    for key in wanted {
-        let found = expanded[cursor..]
-            .iter()
-            .position(|(_, value)| value == &key);
-        let next = cursor
-            + found
-                .ok_or_else(|| anyhow::anyhow!("Model added, substituted, or reordered words"))?;
-        counts[expanded[next].0] += 1;
-        cursor = next + 1;
+    for word in &target {
+        let mut mapped = Vec::new();
+        for key in normalized(word.text) {
+            let found = expanded[cursor..]
+                .iter()
+                .position(|(_, value)| value == &key);
+            let next = cursor
+                + found.ok_or_else(|| {
+                    anyhow::anyhow!("Model added, substituted, or reordered words")
+                })?;
+            let original_index = expanded[next].0;
+            counts[original_index] += 1;
+            mapped.push(original_index);
+            cursor = next + 1;
+        }
+        alignment.push(mapped);
     }
     let kept: Vec<_> = counts.iter().map(|n| *n > 0).collect();
     for (i, count) in counts.iter().enumerate() {
@@ -228,7 +236,45 @@ pub fn validate(original: &str, proposal: &str) -> Result<String> {
             !filler(word.text) || (!mentioned && !quoted),
             "Refused deletion of a literal filler word"
         );
+        let discourse_you_know = i > 0
+            && word.text.eq_ignore_ascii_case("know")
+            && source[i - 1].text.eq_ignore_ascii_case("you")
+            && i + 1 < source.len()
+            && {
+                let separator = &original[word.end..source[i + 1].start];
+                let quoted = original[..source[i - 1].start]
+                    .chars()
+                    .last()
+                    .is_some_and(|c| "\"'“‘".contains(c));
+                let embedded = i >= 2
+                    && matches!(
+                        source[i - 2].text.to_ascii_lowercase().as_str(),
+                        "it" | "that" | "which" | "i" | "we" | "they"
+                    )
+                    && matches!(
+                        source[i + 1].text.to_ascii_lowercase().as_str(),
+                        "doesn't"
+                            | "does"
+                            | "do"
+                            | "don't"
+                            | "did"
+                            | "didn't"
+                            | "is"
+                            | "isn't"
+                            | "was"
+                            | "are"
+                            | "would"
+                            | "will"
+                            | "should"
+                            | "could"
+                            | "can"
+                    );
+                !quoted && (separator.contains(',') || embedded)
+            };
         for key in normalized(word.text) {
+            if key == "know" && discourse_you_know {
+                continue;
+            }
             if !protected(&key) && !protected(word.text) {
                 continue;
             }
@@ -266,8 +312,68 @@ pub fn validate(original: &str, proposal: &str) -> Result<String> {
             );
         }
     }
-    // Reconstruct original words verbatim. LLM punctuation, contractions, case
-    // changes, or markdown never get copied into the output.
+    // For ordinary prose, keep the model's punctuation between validated
+    // words. Reinsert source spellings and contractions so it cannot rename
+    // technical terms. Structured text keeps the source punctuation below.
+    if !original.contains(['`', '{', '}', '[', ']']) {
+        let mut output = String::new();
+        let mut emitted = vec![false; source.len()];
+        let mut previous_end = 0;
+        for (target_index, word) in target.iter().enumerate() {
+            let mut originals = Vec::new();
+            for &index in &alignment[target_index] {
+                if !emitted[index] {
+                    originals.push(source[index].text);
+                    emitted[index] = true;
+                }
+            }
+            if !originals.is_empty() {
+                output.extend(
+                    proposal[previous_end..word.start]
+                        .chars()
+                        .filter(|c| *c != '`'),
+                );
+                let mut spelling = originals.join(" ");
+                // Sentence-initial casing is safe for these common prose words;
+                // names, paths, flags, and arbitrary identifiers keep source case.
+                if (target_index == 0
+                    || proposal[..word.start].trim_end().ends_with(['.', '!', '?']))
+                    && matches!(
+                        spelling.as_str(),
+                        "if" | "i"
+                            | "my"
+                            | "we"
+                            | "our"
+                            | "you"
+                            | "your"
+                            | "they"
+                            | "their"
+                            | "it"
+                            | "the"
+                            | "this"
+                            | "that"
+                            | "and"
+                            | "but"
+                            | "so"
+                            | "keep"
+                            | "run"
+                            | "use"
+                            | "set"
+                            | "let"
+                            | "let's"
+                            | "please"
+                    )
+                {
+                    spelling.replace_range(..1, &spelling[..1].to_ascii_uppercase());
+                }
+                output.push_str(&spelling);
+            }
+            previous_end = word.end;
+        }
+        output.extend(proposal[previous_end..].chars().filter(|c| *c != '`'));
+        return Ok(output.trim().to_owned());
+    }
+    // Code/structured text keeps original punctuation as well as words.
     let indices: Vec<_> = (0..source.len()).filter(|i| kept[*i]).collect();
     let mut output = String::new();
     // Retain wrappers attached to the first surviving word (quotes, JSON/code
@@ -379,6 +485,15 @@ mod tests {
                 "Do not delete the database; use no cloud services.",
                 "Do delete the database; use no cloud services.",
             ),
+            (
+                "You know the password, so do not reset it.",
+                "the password, so do not reset it.",
+            ),
+            (
+                "Do you know which model is enabled?",
+                "Which model is enabled?",
+            ),
+            ("I know this model works.", "This model works."),
         ] {
             assert!(validate(raw, changed).is_err(), "{raw} -> {changed}");
         }
@@ -393,7 +508,7 @@ mod tests {
                 "Run `cargo test --no-default-features` in `/home/justin/git/xhisperflow`."
             )
             .unwrap(),
-            "run cargo test --no-default-features in /home/justin/git/xhisperflow."
+            "Run cargo test --no-default-features in /home/justin/git/xhisperflow."
         );
         let source = "The word um appears in the transcript.";
         assert_eq!(validate(source, source).unwrap(), source);
@@ -402,5 +517,12 @@ mod tests {
             validate("Uh, {\"name\": \"Qwen\"}.", "{\"name\": \"Qwen\"}.").unwrap(),
             "{\"name\": \"Qwen\"}."
         );
+    }
+
+    #[test]
+    fn removes_repeated_discourse_you_know_but_keeps_clause_punctuation_and_qualifications() {
+        let source = "And if we need to clean up, you know, things in the code, you know, I know you had a flag that was local only. If we need to clean up stuff like that, so that it you know doesn't need a flag because it's always local only, then I think that's fine.";
+        let proposed = "If we need to clean up things in the code, I know you had a flag that was local only. If we need to clean up stuff like that so it doesn't need a flag because it's always local only, then I think that's fine.";
+        assert_eq!(validate(source, proposed).unwrap(), proposed);
     }
 }

@@ -104,8 +104,9 @@ xhisperflow --cleanup off
 Cleanup is independent of speech model selection and disabled by default. The
 `off` command disables it and unloads its resident worker. A preview starts that
 worker without enabling automatic cleanup and returns JSON containing `text`,
-`accepted`, `reason`, and `elapsed_ms`. An unchanged proposal may also pass
-validation. Use `xhisperflow --log` to compare raw and final dictated text with
+`accepted`, `reason`, `elapsed_ms`, and passage counts. An unchanged proposal may
+also pass validation. A rejected passage keeps its original text while accepted
+passages still apply; `partial` indicates a mixture, and `timed_out` reports a deadline hit. Use `xhisperflow --log` to compare raw and final dictated text with
 separate timings.
 
 The model is [VoiceInk's Qwen3.5-2B fine-tune](https://github.com/hourliert/VoiceInk-Qwen3.5-2B-FT)
@@ -115,18 +116,29 @@ sockets. Reasoning, tools and the web UI are disabled. No clipboard or window
 context is collected. The cleanup worker logs timing/acceptance metadata only;
 the app's dictation log contains raw and final text.
 
-The model proposes deletions; the app validates and rebuilds from source words.
+The model processes short passages and proposes deletions. The app validates and
+rebuilds from source words while allowing punctuation and sentence-initial casing
+to improve. Technical spellings and original contractions are preserved.
 Generated substitutions, additions and reordered words are rejected. Negations,
 conditions, numbers, code, proper names and qualifications receive additional
 checks, with limited exceptions for clear spoken corrections and duplicate starts.
 These checks cannot prove semantic fidelity; ambiguous backtracking may remain
 unchanged. It does not guess speech recognition mistakes or execute formatting
 commands. Cold startup, missing assets, errors, invalid edits and timeouts preserve
-the original transcript. The default deadline is 750 ms, and inputs exceeding
-3000 UTF-8 bytes are skipped.
+the original passage. The default deadline is **three seconds for the entire
+cleanup pass**, not three seconds per passage. The app reserves a short interval
+to return already accepted edits before the deadline; unprocessed passages stay
+unchanged. Inputs exceeding 16,000 UTF-8 bytes are skipped. This is processing time
+after speech recognition, not a recording-duration limit.
 
 On the development RX 9070 XT machine, short warmed cleanup requests added about
 0.08–0.18 seconds. Resident cleanup added about 1.34 GiB VRAM and 0.69 GiB RSS.
+Measured with the current passage pipeline, 100/200/400-word samples took about
+0.63/1.16/2.29 seconds; a 600-word sample reached the total deadline at 2.93
+seconds and retained its unprocessed passages. The full 163-word regression
+message took about one second and removed repeated discourse fillers. These are
+small local compatibility/latency samples, not an accuracy benchmark. Recording
+length depends on speaking rate (at 150 words/minute, 300 words is two minutes).
 Memory and latency depend on text length. Shared Mac code uses Metal; Mac runtime
 validation is pending.
 
@@ -148,7 +160,7 @@ gpu-device : 0
 transcription-timeout : 120
 transcription-prompt : ""
 cleanup-enabled : true
-cleanup-timeout-ms : 750
+cleanup-timeout-ms : 3000
 ```
 
 Existing `local-*` model and cleanup setting names remain accepted as read

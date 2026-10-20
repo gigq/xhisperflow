@@ -15,7 +15,7 @@ transcription-prompt  : ""
 
 # Optional resident VoiceInk cleanup: scripts/setup-local-cleanup.sh
 cleanup-enabled       : false
-cleanup-timeout-ms    : 750
+cleanup-timeout-ms    : 3000 # total cleanup deadline, including all passages
 
 # Linux insertion: paste (wl-copy + wtype), type, or clipboard (uinput helper).
 output-method           : "type"
