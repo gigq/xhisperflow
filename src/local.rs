@@ -412,8 +412,15 @@ pub fn run_daemon(config: &Config) -> Result<()> {
     );
     for stream in listener.incoming() {
         let mut stream = stream?;
-        stream.set_read_timeout(Some(Duration::from_secs(2)))?;
-        stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+        // A disconnected startup probe can fail timeout setup on macOS;
+        // it must not unload the resident speech model.
+        if stream
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .and_then(|()| stream.set_write_timeout(Some(Duration::from_secs(2))))
+            .is_err()
+        {
+            continue;
+        }
         let request = match read_message(&mut stream) {
             Ok(value) => value,
             // Warmup probes connect and close without sending a request.

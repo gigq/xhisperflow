@@ -125,7 +125,7 @@ fn request(value: &Value, timeout: Duration) -> Result<Value> {
 }
 
 pub fn start() -> Result<()> {
-    if connect(Duration::from_millis(20)).is_ok() {
+    if status().is_ok() {
         return Ok(());
     }
     ensure!(installed(), "Run scripts/setup-local-cleanup.sh first");
@@ -324,7 +324,7 @@ pub fn run_daemon(config: &Config) -> Result<()> {
         .arg(format!(
             "{}{}",
             if cfg!(target_os = "macos") {
-                "Metal"
+                "MTL"
             } else {
                 "Vulkan"
             },
@@ -385,10 +385,17 @@ pub fn run_daemon(config: &Config) -> Result<()> {
                 std::thread::sleep(Duration::from_millis(5));
                 continue;
             }
-            Err(e) => return Err(e.into()),
+            Err(e) => return Err(e).context("Accept cleanup client"),
         };
-        stream.set_read_timeout(Some(Duration::from_millis(100)))?;
-        stream.set_write_timeout(Some(Duration::from_millis(100)))?;
+        // On macOS a client that closes before accept can make timeout setup
+        // fail with EINVAL. Discard that client without ending the worker.
+        if stream
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .and_then(|()| stream.set_write_timeout(Some(Duration::from_millis(100))))
+            .is_err()
+        {
+            continue;
+        }
         let Ok(request) = local::read_message(&mut stream) else {
             continue;
         };

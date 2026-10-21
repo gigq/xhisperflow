@@ -19,7 +19,7 @@ mkdir -p "$destination" "$data_dir/models"
 if [[ ! -d "$source_dir/.git" ]]; then
   git clone --no-checkout https://github.com/handy-computer/transcribe.cpp.git "$source_dir"
 fi
-if [[ "$(git -C "$source_dir" rev-parse HEAD)" != "$revision" ]]; then
+if [[ "$(git -C "$source_dir" rev-parse HEAD)" != "$revision" || ! -f "$source_dir/CMakeLists.txt" ]]; then
   git -C "$source_dir" fetch origin "$revision"
   git -C "$source_dir" checkout --detach "$revision"
 fi
