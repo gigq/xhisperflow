@@ -20,11 +20,12 @@ pub struct WaveformColor {
     b: u8,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WaveformStyle {
     pub gradient_start: WaveformColor,
     pub gradient_end: WaveformColor,
     pub rounded_background: bool,
+    pub speech_gain: f32,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -100,24 +101,51 @@ pub fn draw_waveform(
     mode: WaveformMode,
     style: WaveformStyle,
 ) {
+    draw_waveform_with_scale(buffer, width, height, 1.0, levels, response, mode, style);
+}
+
+/// Render logical waveform dimensions into a physical-pixel backing buffer.
+/// macOS Retina windows have twice as many pixels per point; scaling only the
+/// window would otherwise halve the apparent bar heights, widths and spacing.
+/// Speech gain affects only the listening excursion above the silent baseline.
+pub fn draw_waveform_with_scale(
+    buffer: &mut [u32],
+    width: u32,
+    height: u32,
+    scale_factor: f64,
+    levels: &[f32],
+    response: f32,
+    mode: WaveformMode,
+    style: WaveformStyle,
+) {
+    let scale_factor = if scale_factor.is_finite() && scale_factor > 0.0 {
+        scale_factor
+    } else {
+        1.0
+    };
+    let pixels = |points: u32| (f64::from(points) * scale_factor).round().max(1.0) as u32;
     let width = width.max(1);
     let height = height.max(1);
     buffer.fill(0);
 
     if style.rounded_background {
-        draw_rounded_background(buffer, width, height, 18);
+        draw_rounded_background(buffer, width, height, pixels(18));
     } else {
         buffer.fill(0xff00_0000);
     }
 
-    let waveform_bottom = height.saturating_sub(WAVEFORM_BOTTOM_PADDING).max(1);
-    let waveform_top = waveform_bottom.saturating_sub(WAVEFORM_HEIGHT);
+    let waveform_height = pixels(WAVEFORM_HEIGHT);
+    let minimum_bar_height = pixels(4);
+    let waveform_bottom = height
+        .saturating_sub(pixels(WAVEFORM_BOTTOM_PADDING))
+        .max(1);
+    let waveform_top = waveform_bottom.saturating_sub(waveform_height);
     let center = waveform_top + (waveform_bottom.saturating_sub(waveform_top) / 2);
 
-    let left = 42_u32;
-    let right = width.saturating_sub(42);
-    let bar_width = 3_u32;
-    let gap = 5_u32;
+    let left = pixels(42);
+    let right = width.saturating_sub(pixels(42));
+    let bar_width = pixels(3);
+    let gap = pixels(5);
     let stride = bar_width + gap;
     let drawable_width = right.saturating_sub(left).max(1);
     let bar_count = (drawable_width / stride).max(1);
@@ -129,27 +157,32 @@ pub fn draw_waveform(
             .gradient_start
             .mix(style.gradient_end, progress)
             .to_argb();
-        let (level, taper) = match mode {
+        let level = match mode {
             WaveformMode::Listening => {
                 let raw_level = if levels.is_empty() {
                     0.0
                 } else {
-                    let idx = (bar_index as usize * levels.len() / bar_count as usize)
-                        .min(levels.len().saturating_sub(1));
-                    (levels[idx].sqrt() * response).clamp(0.0, 1.0)
+                    // Each bar represents a complete interval of history. Keep
+                    // its peak so short syllables cannot fall between sampled
+                    // points as more audio fills the fixed-width HUD.
+                    let start = bar_index as usize * levels.len() / bar_count as usize;
+                    let end = ((bar_index as usize + 1) * levels.len() / bar_count as usize)
+                        .max(start + 1)
+                        .min(levels.len());
+                    let peak = levels[start..end].iter().copied().fold(0.0_f32, f32::max);
+                    (peak.sqrt() * response).clamp(0.0, 1.0)
                 };
-                let distance_from_center = ((progress - 0.5).abs() * 2.0).clamp(0.0, 1.0);
-                (
-                    shape_waveform_level(raw_level),
-                    1.0 - distance_from_center * 0.62,
-                )
+                // Position is decorative, not an audio measurement: identical
+                // levels must have identical heights everywhere in the HUD.
+                (shape_waveform_level(raw_level) * style.speech_gain).clamp(0.0, 1.0)
             }
             WaveformMode::Processing { elapsed_seconds } => {
-                (processing_ripple(progress, elapsed_seconds), 1.0)
+                processing_ripple(progress, elapsed_seconds)
             }
         };
-        let bar_height =
-            (4.0 + level * taper * (WAVEFORM_HEIGHT.saturating_sub(4)) as f32).round() as u32;
+        let bar_height = (minimum_bar_height as f32
+            + level * waveform_height.saturating_sub(minimum_bar_height) as f32)
+            .round() as u32;
         let y = center.saturating_sub(bar_height / 2);
         draw_waveform_bar(buffer, width, x, y, bar_width, bar_height, color);
     }
@@ -271,6 +304,70 @@ mod tests {
         assert!(snapshot.last().copied().unwrap_or_default() <= 1.0);
     }
 
+    fn render_speech(levels: &[f32]) -> Vec<u32> {
+        let mut buffer = vec![0; (HUD_WIDTH * HUD_HEIGHT) as usize];
+        draw_waveform(
+            &mut buffer,
+            HUD_WIDTH,
+            HUD_HEIGHT,
+            levels,
+            1.8,
+            WaveformMode::Listening,
+            WaveformStyle {
+                gradient_start: WaveformColor::new(181, 140, 255),
+                gradient_end: WaveformColor::new(215, 230, 255),
+                rounded_background: false,
+                speech_gain: 4.0,
+            },
+        );
+        buffer
+    }
+
+    fn column_heights(buffer: &[u32]) -> Vec<usize> {
+        (0..HUD_WIDTH as usize)
+            .map(|x| {
+                (0..HUD_HEIGHT as usize)
+                    .filter(|y| buffer[y * HUD_WIDTH as usize + x] & 0x00ff_ffff != 0)
+                    .count()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn speech_peak_height_survives_growing_history() {
+        let mut short = vec![0.0; 12];
+        short[8] = 0.08;
+        let short_height = column_heights(&render_speech(&short))
+            .into_iter()
+            .max()
+            .unwrap();
+        assert!(short_height > 4);
+        for peak_index in [0, 1, 8, 17, 89, 178, 179] {
+            let mut full = vec![0.0; LEVEL_HISTORY];
+            full[peak_index] = 0.08;
+            let full_height = column_heights(&render_speech(&full))
+                .into_iter()
+                .max()
+                .unwrap();
+            assert_eq!(
+                full_height, short_height,
+                "peak at history index {peak_index}"
+            );
+        }
+    }
+
+    #[test]
+    fn speech_height_does_not_depend_on_horizontal_position() {
+        let heights = column_heights(&render_speech(&[0.08; LEVEL_HISTORY]));
+        let bar_heights = heights
+            .split(|height| *height == 0)
+            .filter(|bar| !bar.is_empty())
+            .map(|bar| bar.iter().copied().max().unwrap())
+            .collect::<Vec<_>>();
+        assert!(!bar_heights.is_empty());
+        assert_eq!(bar_heights.iter().min(), bar_heights.iter().max());
+    }
+
     #[test]
     fn renderer_draws_transparent_corners_and_colored_bars() {
         let mut buffer = vec![0_u32; (HUD_WIDTH * HUD_HEIGHT) as usize];
@@ -285,11 +382,125 @@ mod tests {
                 gradient_start: WaveformColor::new(181, 140, 255),
                 gradient_end: WaveformColor::new(215, 230, 255),
                 rounded_background: true,
+                speech_gain: 1.0,
             },
         );
         assert_eq!(buffer[0], 0);
         assert!(buffer.contains(&0xf200_0000));
         assert!(buffer.iter().any(|pixel| (*pixel & 0x00ff_ffff) != 0));
+    }
+
+    #[test]
+    fn retina_preserves_logical_waveform_size_for_quiet_speech_and_processing() {
+        fn bounds(buffer: &[u32], width: u32) -> (u32, u32, u32, u32) {
+            let mut bounds = (u32::MAX, u32::MAX, 0, 0);
+            for (index, pixel) in buffer.iter().enumerate() {
+                if pixel & 0x00ff_ffff != 0 {
+                    let x = index as u32 % width;
+                    let y = index as u32 / width;
+                    bounds.0 = bounds.0.min(x);
+                    bounds.1 = bounds.1.min(y);
+                    bounds.2 = bounds.2.max(x);
+                    bounds.3 = bounds.3.max(y);
+                }
+            }
+            assert_ne!(bounds.0, u32::MAX);
+            bounds
+        }
+
+        let style = WaveformStyle {
+            gradient_start: WaveformColor::new(181, 140, 255),
+            gradient_end: WaveformColor::new(215, 230, 255),
+            rounded_background: false,
+            speech_gain: 1.0,
+        };
+        for mode in [
+            WaveformMode::Listening,
+            WaveformMode::Processing {
+                elapsed_seconds: 0.4,
+            },
+        ] {
+            for level in [0.0, 0.015, 0.08, 0.5] {
+                let mut standard = vec![0; (HUD_WIDTH * HUD_HEIGHT) as usize];
+                let mut retina = vec![0; (HUD_WIDTH * HUD_HEIGHT * 4) as usize];
+                draw_waveform(
+                    &mut standard,
+                    HUD_WIDTH,
+                    HUD_HEIGHT,
+                    &[level; 32],
+                    1.8,
+                    mode,
+                    style,
+                );
+                draw_waveform_with_scale(
+                    &mut retina,
+                    HUD_WIDTH * 2,
+                    HUD_HEIGHT * 2,
+                    2.0,
+                    &[level; 32],
+                    1.8,
+                    mode,
+                    style,
+                );
+                let standard = bounds(&standard, HUD_WIDTH);
+                let retina = bounds(&retina, HUD_WIDTH * 2);
+                assert_eq!(retina.0, standard.0 * 2);
+                assert_eq!(retina.2 + 1, (standard.2 + 1) * 2);
+                assert!(retina.1.abs_diff(standard.1 * 2) <= 1);
+                assert!((retina.3 + 1).abs_diff((standard.3 + 1) * 2) <= 1);
+            }
+        }
+    }
+
+    #[test]
+    fn speech_gain_enlarges_speech_but_preserves_silence_processing_and_height_limit() {
+        let width = HUD_WIDTH * 2;
+        let height = HUD_HEIGHT * 2;
+        let render = |level: f32, gain, mode| {
+            let mut buffer = vec![0; (width * height) as usize];
+            draw_waveform_with_scale(
+                &mut buffer,
+                width,
+                height,
+                2.0,
+                &[level; 32],
+                1.8,
+                mode,
+                WaveformStyle {
+                    gradient_start: WaveformColor::new(181, 140, 255),
+                    gradient_end: WaveformColor::new(215, 230, 255),
+                    rounded_background: false,
+                    speech_gain: gain,
+                },
+            );
+            buffer
+        };
+        let tallest_bar = |buffer: &[u32]| {
+            (0..width as usize)
+                .map(|x| {
+                    (0..height as usize)
+                        .filter(|y| buffer[y * width as usize + x] & 0x00ff_ffff != 0)
+                        .count()
+                })
+                .max()
+                .unwrap()
+        };
+        let silence = render(0.0, 1.0, WaveformMode::Listening);
+        assert_eq!(silence, render(0.0, 1.5, WaveformMode::Listening));
+        let baseline = tallest_bar(&silence);
+        for level in [0.015, 0.025] {
+            let old = tallest_bar(&render(level, 1.0, WaveformMode::Listening)) - baseline;
+            let boosted = tallest_bar(&render(level, 1.5, WaveformMode::Listening)) - baseline;
+            assert!(boosted > old);
+            assert!((boosted as f32 - old as f32 * 1.5).abs() <= 1.5);
+        }
+        let processing = WaveformMode::Processing {
+            elapsed_seconds: 0.4,
+        };
+        assert_eq!(render(0.08, 1.0, processing), render(0.08, 1.5, processing));
+        assert!(
+            tallest_bar(&render(1.0, 1.5, WaveformMode::Listening)) <= WAVEFORM_HEIGHT as usize * 2
+        );
     }
 
     #[test]
@@ -324,6 +535,7 @@ mod tests {
                 gradient_start: WaveformColor::new(181, 140, 255),
                 gradient_end: WaveformColor::new(215, 230, 255),
                 rounded_background: true,
+                speech_gain: 1.0,
             },
         );
         let colored_pixels = buffer

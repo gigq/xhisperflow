@@ -2,7 +2,7 @@ use crate::config::{Config, OutputMethod};
 use crate::daemon::{ClientCommand, WrapKey, is_running, send_command};
 #[cfg(target_os = "linux")]
 use crate::linux_hud::LinuxHud;
-use crate::waveform::{WaveformColor, parse_hex_color, push_level, shared_levels};
+use crate::waveform::{WaveformColor, WaveformStyle, parse_hex_color, push_level, shared_levels};
 use anyhow::{Context, Result, bail};
 use std::env;
 use std::ffi::OsString;
@@ -215,8 +215,7 @@ fn start_processing_hud(config: &Config) -> Option<LinuxHud> {
         return None;
     }
 
-    let (gradient_start, gradient_end) = waveform_colors(config);
-    match LinuxHud::spawn_processing(shared_levels(), gradient_start, gradient_end) {
+    match LinuxHud::spawn_processing(shared_levels(), waveform_style(config)) {
         Ok(hud) => {
             dismiss_notification();
             Some(hud)
@@ -663,10 +662,9 @@ impl LevelMeter {
 
         let levels = shared_levels();
         #[cfg(target_os = "linux")]
-        let hud = config.floating_waveform.then(|| {
-            let (gradient_start, gradient_end) = waveform_colors(config);
-            LinuxHud::spawn_recording(levels.clone(), gradient_start, gradient_end)
-        });
+        let hud = config
+            .floating_waveform
+            .then(|| LinuxHud::spawn_recording(levels.clone(), waveform_style(config)));
         #[cfg(target_os = "linux")]
         let hud = hud.and_then(|result| match result {
             Ok(hud) => Some(hud),
@@ -761,17 +759,19 @@ fn raw_peak_percent(raw: u32) -> u8 {
     (raw.min(i16::MAX as u32) as f32 / i16::MAX as f32 * 100.0).round() as u8
 }
 
-fn waveform_colors(config: &Config) -> (WaveformColor, WaveformColor) {
-    (
-        parse_hex_color(
+fn waveform_style(config: &Config) -> WaveformStyle {
+    WaveformStyle {
+        gradient_start: parse_hex_color(
             &config.waveform_gradient_start,
             WaveformColor::new(181, 140, 255),
         ),
-        parse_hex_color(
+        gradient_end: parse_hex_color(
             &config.waveform_gradient_end,
             WaveformColor::new(215, 230, 255),
         ),
-    )
+        rounded_background: true,
+        speech_gain: config.waveform_speech_gain,
+    }
 }
 
 fn get_notification_id() -> Option<String> {

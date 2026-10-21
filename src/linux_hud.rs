@@ -1,6 +1,5 @@
 use crate::waveform::{
-    HUD_HEIGHT, HUD_WIDTH, SharedLevels, WaveformColor, WaveformMode, WaveformStyle, draw_waveform,
-    snapshot,
+    HUD_HEIGHT, HUD_WIDTH, SharedLevels, WaveformMode, WaveformStyle, draw_waveform, snapshot,
 };
 use anyhow::{Context, Result, anyhow};
 use std::env;
@@ -23,42 +22,22 @@ pub struct LinuxHud {
 }
 
 impl LinuxHud {
-    pub fn spawn_recording(
-        levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
-    ) -> Result<Self> {
-        Self::spawn(levels, gradient_start, gradient_end, HudMode::Listening)
+    pub fn spawn_recording(levels: SharedLevels, style: WaveformStyle) -> Result<Self> {
+        Self::spawn(levels, style, HudMode::Listening)
     }
 
-    pub fn spawn_processing(
-        levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
-    ) -> Result<Self> {
-        Self::spawn(levels, gradient_start, gradient_end, HudMode::Processing)
+    pub fn spawn_processing(levels: SharedLevels, style: WaveformStyle) -> Result<Self> {
+        Self::spawn(levels, style, HudMode::Processing)
     }
 
-    fn spawn(
-        levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
-        mode: HudMode,
-    ) -> Result<Self> {
+    fn spawn(levels: SharedLevels, style: WaveformStyle, mode: HudMode) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
         let stop_for_thread = stop.clone();
         let (ready_tx, ready_rx) = mpsc::channel();
         let thread = thread::Builder::new()
             .name("xhisperflow-waveform".to_string())
             .spawn(move || {
-                let result = run_hud(
-                    levels,
-                    gradient_start,
-                    gradient_end,
-                    mode,
-                    stop_for_thread,
-                    ready_tx.clone(),
-                );
+                let result = run_hud(levels, style, mode, stop_for_thread, ready_tx.clone());
                 if let Err(err) = result {
                     let _ = ready_tx.send(Err(format!("{err:#}")));
                     eprintln!("waveform HUD unavailable: {err:#}");
@@ -100,8 +79,7 @@ impl Drop for LinuxHud {
 
 fn run_hud(
     levels: SharedLevels,
-    gradient_start: WaveformColor,
-    gradient_end: WaveformColor,
+    style: WaveformStyle,
     mode: HudMode,
     stop: Arc<AtomicBool>,
     ready: mpsc::Sender<Result<(), String>>,
@@ -110,14 +88,7 @@ fn run_hud(
         || env::var("XDG_SESSION_TYPE").is_ok_and(|value| value.eq_ignore_ascii_case("wayland"));
 
     if wayland_requested {
-        match wayland::run(
-            levels.clone(),
-            gradient_start,
-            gradient_end,
-            mode,
-            stop.clone(),
-            ready.clone(),
-        ) {
+        match wayland::run(levels.clone(), style, mode, stop.clone(), ready.clone()) {
             Ok(()) => return Ok(()),
             Err(err) if env::var_os("DISPLAY").is_some() => {
                 eprintln!("Wayland waveform HUD unavailable, trying X11: {err:#}");
@@ -127,7 +98,7 @@ fn run_hud(
     }
 
     if env::var_os("DISPLAY").is_some() {
-        return x11::run(levels, gradient_start, gradient_end, mode, stop, ready);
+        return x11::run(levels, style, mode, stop, ready);
     }
 
     Err(anyhow!("neither a Wayland nor X11 display is available"))
@@ -158,8 +129,7 @@ mod wayland {
 
     pub fn run(
         levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
+        style: WaveformStyle,
         mode: HudMode,
         stop: Arc<AtomicBool>,
         ready: mpsc::Sender<Result<(), String>>,
@@ -206,8 +176,7 @@ mod wayland {
             exit: false,
             stop,
             levels,
-            gradient_start,
-            gradient_end,
+            style,
             mode,
             animation_started: Instant::now(),
             ready: Some(ready),
@@ -233,8 +202,7 @@ mod wayland {
         exit: bool,
         stop: Arc<AtomicBool>,
         levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
+        style: WaveformStyle,
         mode: HudMode,
         animation_started: Instant,
         ready: Option<mpsc::Sender<Result<(), String>>>,
@@ -268,11 +236,7 @@ mod wayland {
                 &snapshot(&self.levels),
                 1.8,
                 waveform_mode(self.mode, self.animation_started),
-                WaveformStyle {
-                    gradient_start: self.gradient_start,
-                    gradient_end: self.gradient_end,
-                    rounded_background: true,
-                },
+                self.style,
             );
             for (bytes, pixel) in canvas.chunks_exact_mut(4).zip(pixels) {
                 bytes.copy_from_slice(&pixel.to_le_bytes());
@@ -450,8 +414,7 @@ mod x11 {
 
     pub fn run(
         levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
+        style: WaveformStyle,
         mode: HudMode,
         stop: Arc<AtomicBool>,
         ready: mpsc::Sender<Result<(), String>>,
@@ -465,8 +428,7 @@ mod x11 {
             surface: None,
             stop,
             levels,
-            gradient_start,
-            gradient_end,
+            style,
             mode,
             animation_started: Instant::now(),
             ready: Some(ready),
@@ -482,8 +444,7 @@ mod x11 {
         surface: Option<HudSurface>,
         stop: Arc<AtomicBool>,
         levels: SharedLevels,
-        gradient_start: WaveformColor,
-        gradient_end: WaveformColor,
+        style: WaveformStyle,
         mode: HudMode,
         animation_started: Instant,
         ready: Option<mpsc::Sender<Result<(), String>>>,
@@ -555,11 +516,7 @@ mod x11 {
                 &snapshot(&self.levels),
                 1.8,
                 waveform_mode(self.mode, self.animation_started),
-                WaveformStyle {
-                    gradient_start: self.gradient_start,
-                    gradient_end: self.gradient_end,
-                    rounded_background: true,
-                },
+                self.style,
             );
             buffer
                 .present()

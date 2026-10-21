@@ -2,7 +2,7 @@ use crate::app::{LOG_PATH, log_timed_step, post_process, sleep_secs, transcribe}
 use crate::config::{Config, config_file_path, home_dir};
 use crate::waveform::{
     HUD_HEIGHT, HUD_WIDTH, LEVEL_HISTORY, SharedLevels, WaveformColor, WaveformMode, WaveformStyle,
-    draw_waveform, parse_hex_color, push_level, shared_levels, snapshot,
+    draw_waveform_with_scale, parse_hex_color, push_level, shared_levels, snapshot,
 };
 use anyhow::{Context, Result, anyhow, bail};
 use arboard::Clipboard;
@@ -764,10 +764,11 @@ impl MacApp {
             &self.config.waveform_gradient_end,
             WaveformColor::new(215, 230, 255),
         );
-        draw_waveform(
+        draw_waveform_with_scale(
             &mut buffer,
             size.width,
             size.height,
+            window.scale_factor(),
             &levels,
             match self.state {
                 AppState::Recording => 1.8,
@@ -788,6 +789,7 @@ impl MacApp {
                 gradient_start,
                 gradient_end,
                 rounded_background: false,
+                speech_gain: self.config.waveform_speech_gain,
             },
         );
         buffer

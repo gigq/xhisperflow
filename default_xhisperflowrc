@@ -26,6 +26,7 @@ non-ascii-default-delay  : 0.025
 
 # Waveform HUD (macOS and Linux)
 floating-waveform       : true
+waveform-speech-gain    : 1.0 # 0.0-4.0; 1 = normal, 1.5 = 50% taller speech
 waveform-gradient-start : "#b58cff"
 waveform-gradient-end   : "#d7e6ff"
 

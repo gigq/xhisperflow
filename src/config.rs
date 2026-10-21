@@ -28,6 +28,7 @@ pub struct Config {
     pub mac_hotkey: String,
     pub mac_cancel_hotkey: String,
     pub floating_waveform: bool,
+    pub waveform_speech_gain: f32,
     pub waveform_gradient_start: String,
     pub waveform_gradient_end: String,
 }
@@ -52,6 +53,7 @@ impl Default for Config {
             mac_hotkey: "alt+space".to_string(),
             mac_cancel_hotkey: "ctrl+shift".to_string(),
             floating_waveform: true,
+            waveform_speech_gain: 1.0,
             waveform_gradient_start: "#b58cff".to_string(),
             waveform_gradient_end: "#d7e6ff".to_string(),
         }
@@ -150,6 +152,13 @@ impl Config {
                 "floating-waveform" | "mac-floating-waveform" => {
                     if let Some(parsed) = parse_bool(&value) {
                         config.floating_waveform = parsed;
+                    }
+                }
+                "waveform-speech-gain" => {
+                    if let Ok(gain) = value.parse::<f32>() {
+                        if gain.is_finite() && (0.0..=4.0).contains(&gain) {
+                            config.waveform_speech_gain = gain;
+                        }
                     }
                 }
                 "waveform-gradient-start" | "mac-waveform-gradient-start" if !value.is_empty() => {
@@ -274,7 +283,27 @@ mod tests {
         assert_eq!(config.mac_hotkey, "alt+space");
         assert_eq!(config.mac_cancel_hotkey, "ctrl+shift");
         assert!(config.floating_waveform);
+        assert_eq!(config.waveform_speech_gain, 1.0);
         assert_eq!(config.waveform_gradient_start, "#b58cff");
         assert_eq!(config.waveform_gradient_end, "#d7e6ff");
+    }
+
+    #[test]
+    fn waveform_speech_gain_accepts_finite_multipliers_and_ignores_invalid_values() {
+        assert_eq!(Config::from_contents("").waveform_speech_gain, 1.0);
+        for gain in [0.0, 0.25, 1.0, 1.5, 2.0, 4.0] {
+            let config = Config::from_contents(&format!("waveform-speech-gain : {gain}"));
+            assert_eq!(config.waveform_speech_gain, gain);
+        }
+        let config = Config::from_contents("waveform-speech-gain : \"1.5\" # larger speech");
+        assert_eq!(config.waveform_speech_gain, 1.5);
+        for invalid in ["-0.1", "4.01", "NaN", "inf", "-inf", "1e50", "large", ""] {
+            let config = Config::from_contents(&format!("waveform-speech-gain : {invalid}"));
+            assert_eq!(config.waveform_speech_gain, 1.0);
+            let config = Config::from_contents(&format!(
+                "waveform-speech-gain : 1.5\nwaveform-speech-gain : {invalid}"
+            ));
+            assert_eq!(config.waveform_speech_gain, 1.5);
+        }
     }
 }

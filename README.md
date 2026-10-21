@@ -216,6 +216,16 @@ On both platforms, `floating-waveform` controls the HUD, and
 `waveform-gradient-start`/`waveform-gradient-end` accept quoted `#RRGGBB` colors.
 Existing `mac-*` waveform names are accepted for compatibility.
 
+`waveform-speech-gain` controls speech-driven bar height on both platforms.
+The default is `1.0`; use `1.5` for 50% more movement, `2.0` for double, or `0.0`
+for a flat baseline. Values from `0.0` to `4.0` are accepted; invalid or
+out-of-range values are ignored. This changes only the visual height above the
+silent baseline, capped at the HUD's maximum height. It does not affect recording
+volume, transcription, bar width, or the processing animation. Changes apply on
+the next recording; restarting the app or resident models is unnecessary.
+Speech peaks are preserved when compressing the history into visible bars, and
+the same audio level produces the same bar height across the width of the HUD.
+
 ## File transcription
 
 ```sh
